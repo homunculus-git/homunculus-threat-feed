@@ -9,10 +9,23 @@ import aiohttp
 import requests
 import feedparser
 from dotenv import load_dotenv
+from deep_translator import GoogleTranslator
 
 load_dotenv()
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
+
+# --- TRANSLATOR ENGINE ---
+translator = GoogleTranslator(source='auto', target='en')
+
+def translate_to_english(text: str) -> str:
+    """Translates non-English advisories (German, French, etc.) into clean English."""
+    if not text:
+        return ""
+    try:
+        return translator.translate(text)
+    except Exception:
+        return text
 
 # --- DATABASE PERSISTENCE (DEDUPLICATION) ---
 conn = sqlite3.connect("threat_cache.db")
@@ -35,11 +48,9 @@ def record_event(event_id: str, source: str):
     conn.commit()
 
 def defang_url(url: str) -> str:
-    """Sanitises malicious links to prevent accidental clicks."""
     return url.replace("http://", "hxxp://").replace("https://", "hxxps://").replace(".", "[.]")
 
 def clean_html_to_markdown(raw_html: str) -> str:
-    """Converts HTML links into Discord Markdown and strips raw HTML tags."""
     if not raw_html:
         return ""
     text = html.unescape(raw_html)
@@ -49,10 +60,8 @@ def clean_html_to_markdown(raw_html: str) -> str:
     return text
 
 def dispatch_discord_embed(title: str, description: str, fields: list, color: int, image_url: str = None):
-    """Formats and dispatches styled embeds to Discord with optional screenshot/image attachment."""
     if not DISCORD_WEBHOOK or "discord.com" not in DISCORD_WEBHOOK:
         return
-    
     embed = {
         "title": title[:256],
         "description": description[:2000],
@@ -60,7 +69,6 @@ def dispatch_discord_embed(title: str, description: str, fields: list, color: in
         "fields": fields,
         "footer": {"text": "Homunculus CTI Core • Automated Threat Stream"}
     }
-    
     if image_url and image_url.startswith("http"):
         embed["image"] = {"url": image_url}
 
@@ -68,13 +76,11 @@ def dispatch_discord_embed(title: str, description: str, fields: list, color: in
     try:
         requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
     except Exception as err:
-        print(f"[Discord Dispatch Error] {err}")
+        print(f"[Discord Error] {err}")
 
 # --- COLLECTOR TASKS ---
 
-# 1. Dark Web Ransomware Leak Trackers (Red - 0xE74C3C)
 async def poll_leak_trackers(session):
-    # Ransomware.live v2 (With Extortion Note, Data Size, and Screenshots)
     try:
         async with session.get("https://api.ransomware.live/v2/recentvictims", timeout=15) as resp:
             if resp.status == 200:
@@ -82,38 +88,28 @@ async def poll_leak_trackers(session):
                     victim = v.get("victim") or "Confidential Victim"
                     group = v.get("group") or "Unknown"
                     event_id = f"rwlive_{group}_{victim}".lower().strip()
-                    
                     if not is_duplicate(event_id):
                         record_event(event_id, "Ransomware.live")
-                        
-                        # Extract the actual extortion text / claims
-                        note_text = v.get("description") or "No detailed extortion note was disclosed by the group."
+                        note_text = v.get("description") or "No detailed extortion note disclosed."
                         clean_note = clean_html_to_markdown(note_text)[:450]
-                        
-                        # Screenshot of the dark web post if available
-                        screenshot_url = v.get("screenshot")
-                        
                         fields = [
                             {"name": "Threat Actor", "value": f"`{group}`", "inline": True},
                             {"name": "Target Country", "value": v.get("country", "Global"), "inline": True},
                             {"name": "Data Claimed", "value": v.get("data_size") or "Unspecified", "inline": True}
                         ]
-                        
                         permalink = v.get("permalink") or v.get("post_url")
                         if permalink:
                             fields.append({"name": "Full Extortion Dossier", "value": f"[Inspect Leak Page]({permalink})", "inline": False})
-                        
                         dispatch_discord_embed(
                             title=f"🚨 Ransomware Alert: {victim}",
                             description=f"**Extortion Notice / Group Claim:**\n>>> {clean_note}",
                             fields=fields,
                             color=0xE74C3C,
-                            image_url=screenshot_url
+                            image_url=v.get("screenshot")
                         )
     except Exception as e:
         print(f"[Collector Error] Ransomware.live: {e}")
 
-    # RansomLook API
     try:
         async with session.get("https://www.ransomlook.io/api/posts?days=1", timeout=15) as resp:
             if resp.status == 200:
@@ -124,10 +120,9 @@ async def poll_leak_trackers(session):
                     if not is_duplicate(event_id):
                         record_event(event_id, "RansomLook")
                         desc = post.get("description") or "Target listed on double-extortion leak directory."
-                        clean_desc = clean_html_to_markdown(desc)[:350]
                         dispatch_discord_embed(
                             title=f"🚨 Ransomware Alert: {victim}",
-                            description=f"**Extortion Claim:**\n>>> {clean_desc}",
+                            description=f"**Extortion Claim:**\n>>> {clean_html_to_markdown(desc)[:350]}",
                             fields=[
                                 {"name": "Threat Actor", "value": f"`{group}`", "inline": True},
                                 {"name": "Source", "value": "RansomLook API", "inline": True}
@@ -137,7 +132,6 @@ async def poll_leak_trackers(session):
     except Exception as e:
         print(f"[Collector Error] RansomLook: {e}")
 
-    # Ransomwatch Raw Git Feed
     try:
         async with session.get("https://raw.githubusercontent.com/joshhighet/ransomwatch/main/posts.json", timeout=20) as resp:
             if resp.status == 200:
@@ -159,9 +153,7 @@ async def poll_leak_trackers(session):
     except Exception as e:
         print(f"[Collector Error] Ransomwatch: {e}")
 
-# 2. C2 & Malicious Infrastructure (Yellow / Orange / Purple)
 async def poll_infrastructure(session):
-    # Feodo Tracker
     try:
         async with session.get("https://feodotracker.abuse.ch/downloads/ipblocklist_recent.json", timeout=15) as resp:
             if resp.status == 200:
@@ -182,7 +174,6 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] Feodo: {e}")
 
-    # ThreatMon Daily C2 Feed
     try:
         async with session.get("https://raw.githubusercontent.com/ThreatMon/ThreatMon-Daily-C2-Feeds/main/daily-c2.csv", timeout=15) as resp:
             if resp.status == 200:
@@ -190,8 +181,7 @@ async def poll_infrastructure(session):
                 reader = csv.reader(io.StringIO(text))
                 for row in list(reader)[:4]:
                     if row and len(row) >= 2 and not row[0].startswith("#"):
-                        c2_ip = row[0].strip()
-                        c2_type = row[1].strip() if len(row) > 1 else "Malicious C2"
+                        c2_ip, c2_type = row[0].strip(), row[1].strip() if len(row) > 1 else "Malicious C2"
                         event_id = f"tmon_{c2_ip}"
                         if not is_duplicate(event_id):
                             record_event(event_id, "ThreatMon")
@@ -205,9 +195,8 @@ async def poll_infrastructure(session):
                                 color=0xF1C40F
                             )
     except Exception as e:
-        print(f"[Collector Error] ThreatMon C2: {e}")
+        print(f"[Collector Error] ThreatMon: {e}")
 
-    # URLhaus Droppers
     try:
         async with session.get("https://urlhaus.abuse.ch/downloads/csv_recent/", timeout=15) as resp:
             if resp.status == 200:
@@ -231,7 +220,6 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] URLhaus: {e}")
 
-    # OpenPhish
     try:
         async with session.get("https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt", timeout=15) as resp:
             if resp.status == 200:
@@ -251,7 +239,6 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] OpenPhish: {e}")
 
-# 3. Live Malware Binaries (MalwareBazaar)
 async def poll_malware_bazaar(session):
     url = "https://mb-api.abuse.ch/api/v1/"
     data = {"query": "get_recent", "selector": "10"}
@@ -280,7 +267,6 @@ async def poll_malware_bazaar(session):
     except Exception as e:
         print(f"[Collector Error] MalwareBazaar: {e}")
 
-# 4. Actively Exploited CVEs
 async def poll_vulnerabilities(session):
     try:
         async with session.get("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", timeout=15) as resp:
@@ -304,39 +290,44 @@ async def poll_vulnerabilities(session):
     except Exception as e:
         print(f"[Collector Error] CISA KEV: {e}")
 
-# 5. RSS Advisories, Research & Breaking Disclosures
 async def poll_rss_streams():
+    # Feeds catalog: (publisher, url, alert_type, color, requires_translation)
     rss_catalog = [
-        # National CERT Advisories (Blue)
-        ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡️ Government Advisory", 0x2980B9),
-        ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡️ Government Advisory", 0x2980B9),
-        ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡️ Government Advisory", 0x2980B9),
-        ("CERT-EU", "https://cert.europa.eu/publications/security-advisories/rss.xml", "🛡️ Government Advisory", 0x2980B9),
-        ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡️ Government Advisory", 0x2980B9),
-        # Industrial Control Systems
-        ("CISA ICS", "https://www.cisa.gov/rss/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400),
-        # Critical CVE Stream
-        ("AssureStart CVE", "https://cve.assurestart.co/api/feed.xml?cvss_min=9", "🦠 Vulnerability Alert", 0xE67E22),
-        # Threat Research, Taxonomy & Operations
-        ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C),
-        ("Malpedia", "https://malpedia.caad.fkie.fraunhofer.de/rss", "🧬 Threat Actor Taxonomy Update", 0x8E44AD),
-        ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB),
-        # Incident Reports & Breaking News
-        ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71),
-        ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71)
+        ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡️ Government Advisory", 0x2980B9, False),
+        ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡️ Government Advisory", 0x2980B9, False),
+        ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡️ Government Advisory", 0x2980B9, True),
+        ("CERT-EU", "https://cert.europa.eu/publications/security-advisories/rss.xml", "🛡️ Government Advisory", 0x2980B9, False),
+        ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡️ Government Advisory", 0x2980B9, True),
+        ("CISA ICS", "https://www.cisa.gov/rss/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400, False),
+        ("AssureStart CVE", "https://cve.assurestart.co/api/feed.xml?cvss_min=9", "🦠 Vulnerability Alert", 0xE67E22, False),
+        ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C, False),
+        ("Malpedia", "https://malpedia.caad.fkie.fraunhofer.de/rss", "🧬 Threat Actor Taxonomy Update", 0x8E44AD, False),
+        ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB, False),
+        ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71, False),
+        ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71, False)
     ]
-    for publisher, feed_url, alert_type, color in rss_catalog:
+    for publisher, feed_url, alert_type, color, needs_translation in rss_catalog:
         try:
             feed = feedparser.parse(feed_url)
             for entry in feed.entries[:3]:
                 event_id = f"rss_{entry.get('id', entry.link)}"
                 if not is_duplicate(event_id):
                     record_event(event_id, publisher)
+                    raw_title = entry.title
                     raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
                     clean_text = clean_html_to_markdown(raw_content)[:350]
+
+                    # Auto-translate if German or French feed
+                    if needs_translation:
+                        final_title = f"{alert_type} [Translated]: {translate_to_english(raw_title)}"
+                        final_desc = translate_to_english(clean_text)
+                    else:
+                        final_title = f"{alert_type}: {raw_title}"
+                        final_desc = clean_text
+
                     dispatch_discord_embed(
-                        title=f"{alert_type}: {entry.title}",
-                        description=clean_text + ("..." if len(clean_text) >= 350 else ""),
+                        title=final_title,
+                        description=final_desc + ("..." if len(final_desc) >= 350 else ""),
                         fields=[
                             {"name": "Publisher", "value": publisher, "inline": True},
                             {"name": "Details", "value": f"[Open Document / Article]({entry.link})", "inline": False}
@@ -346,10 +337,8 @@ async def poll_rss_streams():
         except Exception as e:
             print(f"[RSS Error] {publisher}: {e}")
 
-# --- ORCHESTRATION ---
-
 async def main():
-    print("[*] Homunculus 21-Source Threat Intelligence Engine Active.")
+    print("[*] Homunculus 21-Source Multilingual Threat Engine Active.")
     while True:
         async with aiohttp.ClientSession() as session:
             await asyncio.gather(
