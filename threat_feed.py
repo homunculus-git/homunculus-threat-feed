@@ -8,6 +8,7 @@ import asyncio
 import aiohttp
 import requests
 import feedparser
+import urllib.parse
 from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
 
@@ -19,7 +20,6 @@ DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 translator = GoogleTranslator(source='auto', target='en')
 
 def translate_to_english(text: str) -> str:
-    """Translates non-English advisories (German, French, etc.) into clean English."""
     if not text:
         return ""
     try:
@@ -181,7 +181,8 @@ async def poll_infrastructure(session):
                 reader = csv.reader(io.StringIO(text))
                 for row in list(reader)[:4]:
                     if row and len(row) >= 2 and not row[0].startswith("#"):
-                        c2_ip, c2_type = row[0].strip(), row[1].strip() if len(row) > 1 else "Malicious C2"
+                        c2_ip = row[0].strip()
+                        c2_type = row[1].strip() if len(row) > 1 else "Malicious C2"
                         event_id = f"tmon_{c2_ip}"
                         if not is_duplicate(event_id):
                             record_event(event_id, "ThreatMon")
@@ -208,31 +209,42 @@ async def poll_infrastructure(session):
                         event_id = f"urlhaus_{row[0]}"
                         if not is_duplicate(event_id):
                             record_event(event_id, "URLhaus")
+                            encoded_target = urllib.parse.quote(raw_url, safe='')
+                            vt_url = f"https://www.virustotal.com/gui/search/{encoded_target}"
                             dispatch_discord_embed(
                                 title=f"☣️ Malware Dropper: {threat}",
                                 description="Payload distribution URL detected in live attacks.",
                                 fields=[
                                     {"name": "Defanged Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
-                                    {"name": "Tags", "value": f"`{tags}`", "inline": True}
+                                    {"name": "Tags", "value": f"`{tags}`", "inline": True},
+                                    {"name": "Sandbox Check", "value": f"[Scan on VirusTotal]({vt_url})", "inline": False}
                                 ],
                                 color=0xE67E22
                             )
     except Exception as e:
         print(f"[Collector Error] URLhaus: {e}")
 
+    # OpenPhish with direct VirusTotal and URLScan sandbox links
     try:
         async with session.get("https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt", timeout=15) as resp:
             if resp.status == 200:
                 for raw_link in (await resp.text()).splitlines()[:3]:
-                    if raw_link.strip():
-                        event_id = f"phish_{hash(raw_link.strip())}"
+                    link = raw_link.strip()
+                    if link:
+                        event_id = f"phish_{hash(link)}"
                         if not is_duplicate(event_id):
                             record_event(event_id, "OpenPhish")
+                            
+                            encoded_target = urllib.parse.quote(link, safe='')
+                            vt_url = f"https://www.virustotal.com/gui/search/{encoded_target}"
+                            urlscan_search = f"https://urlscan.io/search/#page.url:%22{encoded_target}%22"
+
                             dispatch_discord_embed(
                                 title="🎣 Malicious Infrastructure: Phishing Site",
                                 description="Credential harvest target identified in live circulation.",
                                 fields=[
-                                    {"name": "Defanged Link", "value": f"`{defang_url(raw_link.strip())[:150]}`", "inline": False}
+                                    {"name": "Defanged Link", "value": f"`{defang_url(link)[:120]}`", "inline": False},
+                                    {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Search on URLScan.io]({urlscan_search})", "inline": False}
                                 ],
                                 color=0x9B59B6
                             )
@@ -254,13 +266,15 @@ async def poll_malware_bazaar(session):
                         event_id = f"bazaar_{sha256}"
                         if not is_duplicate(event_id):
                             record_event(event_id, "MalwareBazaar")
+                            vt_hash_url = f"https://www.virustotal.com/gui/file/{sha256}"
                             dispatch_discord_embed(
                                 title=f"🔬 New Malware Sample: {malware}",
                                 description=f"A fresh `{file_type}` payload was staged and identified.",
                                 fields=[
                                     {"name": "Signature", "value": f"`{malware}`", "inline": True},
                                     {"name": "File Type", "value": f"`{file_type}`", "inline": True},
-                                    {"name": "SHA256", "value": f"`{sha256[:20]}...`", "inline": False}
+                                    {"name": "SHA256", "value": f"`{sha256[:20]}...`", "inline": False},
+                                    {"name": "Hash Analysis", "value": f"[Inspect Binary on VirusTotal]({vt_hash_url})", "inline": False}
                                 ],
                                 color=0x95A5A6
                             )
@@ -291,7 +305,6 @@ async def poll_vulnerabilities(session):
         print(f"[Collector Error] CISA KEV: {e}")
 
 async def poll_rss_streams():
-    # Feeds catalog: (publisher, url, alert_type, color, requires_translation)
     rss_catalog = [
         ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡️ Government Advisory", 0x2980B9, False),
         ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡️ Government Advisory", 0x2980B9, False),
@@ -317,7 +330,6 @@ async def poll_rss_streams():
                     raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
                     clean_text = clean_html_to_markdown(raw_content)[:350]
 
-                    # Auto-translate if German or French feed
                     if needs_translation:
                         final_title = f"{alert_type} [Translated]: {translate_to_english(raw_title)}"
                         final_desc = translate_to_english(clean_text)
