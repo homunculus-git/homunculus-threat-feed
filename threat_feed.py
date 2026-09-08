@@ -48,19 +48,23 @@ def clean_html_to_markdown(raw_html: str) -> str:
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def dispatch_discord_embed(title: str, description: str, fields: list, color: int):
-    """Formats and dispatches styled embeds to Discord."""
+def dispatch_discord_embed(title: str, description: str, fields: list, color: int, image_url: str = None):
+    """Formats and dispatches styled embeds to Discord with optional screenshot/image attachment."""
     if not DISCORD_WEBHOOK or "discord.com" not in DISCORD_WEBHOOK:
         return
-    payload = {
-        "embeds": [{
-            "title": title[:256],
-            "description": description[:2000],
-            "color": color,
-            "fields": fields,
-            "footer": {"text": "Homunculus CTI Core • Automated Threat Stream"}
-        }]
+    
+    embed = {
+        "title": title[:256],
+        "description": description[:2000],
+        "color": color,
+        "fields": fields,
+        "footer": {"text": "Homunculus CTI Core • Automated Threat Stream"}
     }
+    
+    if image_url and image_url.startswith("http"):
+        embed["image"] = {"url": image_url}
+
+    payload = {"embeds": [embed]}
     try:
         requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
     except Exception as err:
@@ -70,7 +74,7 @@ def dispatch_discord_embed(title: str, description: str, fields: list, color: in
 
 # 1. Dark Web Ransomware Leak Trackers (Red - 0xE74C3C)
 async def poll_leak_trackers(session):
-    # Ransomware.live v2
+    # Ransomware.live v2 (With Extortion Note, Data Size, and Screenshots)
     try:
         async with session.get("https://api.ransomware.live/v2/recentvictims", timeout=15) as resp:
             if resp.status == 200:
@@ -78,17 +82,33 @@ async def poll_leak_trackers(session):
                     victim = v.get("victim") or "Confidential Victim"
                     group = v.get("group") or "Unknown"
                     event_id = f"rwlive_{group}_{victim}".lower().strip()
+                    
                     if not is_duplicate(event_id):
                         record_event(event_id, "Ransomware.live")
+                        
+                        # Extract the actual extortion text / claims
+                        note_text = v.get("description") or "No detailed extortion note was disclosed by the group."
+                        clean_note = clean_html_to_markdown(note_text)[:450]
+                        
+                        # Screenshot of the dark web post if available
+                        screenshot_url = v.get("screenshot")
+                        
+                        fields = [
+                            {"name": "Threat Actor", "value": f"`{group}`", "inline": True},
+                            {"name": "Target Country", "value": v.get("country", "Global"), "inline": True},
+                            {"name": "Data Claimed", "value": v.get("data_size") or "Unspecified", "inline": True}
+                        ]
+                        
+                        permalink = v.get("permalink") or v.get("post_url")
+                        if permalink:
+                            fields.append({"name": "Full Extortion Dossier", "value": f"[Inspect Leak Page]({permalink})", "inline": False})
+                        
                         dispatch_discord_embed(
                             title=f"🚨 Ransomware Alert: {victim}",
-                            description=f"Group **{group}** has published an extortion notice.",
-                            fields=[
-                                {"name": "Threat Actor", "value": f"`{group}`", "inline": True},
-                                {"name": "Target Country", "value": v.get("country", "Global"), "inline": True},
-                                {"name": "Source", "value": "Ransomware.live v2", "inline": True}
-                            ],
-                            color=0xE74C3C
+                            description=f"**Extortion Notice / Group Claim:**\n>>> {clean_note}",
+                            fields=fields,
+                            color=0xE74C3C,
+                            image_url=screenshot_url
                         )
     except Exception as e:
         print(f"[Collector Error] Ransomware.live: {e}")
@@ -103,9 +123,11 @@ async def poll_leak_trackers(session):
                     event_id = f"rlook_{group}_{victim}".lower().strip()
                     if not is_duplicate(event_id):
                         record_event(event_id, "RansomLook")
+                        desc = post.get("description") or "Target listed on double-extortion leak directory."
+                        clean_desc = clean_html_to_markdown(desc)[:350]
                         dispatch_discord_embed(
                             title=f"🚨 Ransomware Alert: {victim}",
-                            description="Identified on double-extortion dark web directory.",
+                            description=f"**Extortion Claim:**\n>>> {clean_desc}",
                             fields=[
                                 {"name": "Threat Actor", "value": f"`{group}`", "inline": True},
                                 {"name": "Source", "value": "RansomLook API", "inline": True}
@@ -127,7 +149,7 @@ async def poll_leak_trackers(session):
                         record_event(event_id, "Ransomwatch")
                         dispatch_discord_embed(
                             title=f"🚨 Ransomware Alert: {victim}",
-                            description=f"Automated crawler detected leak post under **{group}**.",
+                            description=f"Automated crawler detected fresh victim published on **{group}**'s leak site.",
                             fields=[
                                 {"name": "Threat Actor", "value": f"`{group}`", "inline": True},
                                 {"name": "Source", "value": "Ransomwatch Git Data", "inline": True}
@@ -139,7 +161,7 @@ async def poll_leak_trackers(session):
 
 # 2. C2 & Malicious Infrastructure (Yellow / Orange / Purple)
 async def poll_infrastructure(session):
-    # Feodo Tracker (Botnet C2s)
+    # Feodo Tracker
     try:
         async with session.get("https://feodotracker.abuse.ch/downloads/ipblocklist_recent.json", timeout=15) as resp:
             if resp.status == 200:
@@ -155,7 +177,7 @@ async def poll_infrastructure(session):
                                 {"name": "Host", "value": f"`{ip}:{port}`", "inline": True},
                                 {"name": "Family", "value": f"`{malware}`", "inline": True}
                             ],
-                            color=0xF1C40F  # Yellow
+                            color=0xF1C40F
                         )
     except Exception as e:
         print(f"[Collector Error] Feodo: {e}")
@@ -180,7 +202,7 @@ async def poll_infrastructure(session):
                                     {"name": "Host", "value": f"`{c2_ip}`", "inline": True},
                                     {"name": "Type", "value": f"`{c2_type}`", "inline": True}
                                 ],
-                                color=0xF1C40F  # Yellow
+                                color=0xF1C40F
                             )
     except Exception as e:
         print(f"[Collector Error] ThreatMon C2: {e}")
@@ -204,7 +226,7 @@ async def poll_infrastructure(session):
                                     {"name": "Defanged Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
                                     {"name": "Tags", "value": f"`{tags}`", "inline": True}
                                 ],
-                                color=0xE67E22  # Orange
+                                color=0xE67E22
                             )
     except Exception as e:
         print(f"[Collector Error] URLhaus: {e}")
@@ -224,12 +246,12 @@ async def poll_infrastructure(session):
                                 fields=[
                                     {"name": "Defanged Link", "value": f"`{defang_url(raw_link.strip())[:150]}`", "inline": False}
                                 ],
-                                color=0x9B59B6  # Purple
+                                color=0x9B59B6
                             )
     except Exception as e:
         print(f"[Collector Error] OpenPhish: {e}")
 
-# 3. Live Malware Binaries (abuse.ch MalwareBazaar - Grey 0x95A5A6)
+# 3. Live Malware Binaries (MalwareBazaar)
 async def poll_malware_bazaar(session):
     url = "https://mb-api.abuse.ch/api/v1/"
     data = {"query": "get_recent", "selector": "10"}
@@ -253,12 +275,12 @@ async def poll_malware_bazaar(session):
                                     {"name": "File Type", "value": f"`{file_type}`", "inline": True},
                                     {"name": "SHA256", "value": f"`{sha256[:20]}...`", "inline": False}
                                 ],
-                                color=0x95A5A6  # Grey
+                                color=0x95A5A6
                             )
     except Exception as e:
         print(f"[Collector Error] MalwareBazaar: {e}")
 
-# 4. Actively Exploited CVEs (Orange - 0xE67E22)
+# 4. Actively Exploited CVEs
 async def poll_vulnerabilities(session):
     try:
         async with session.get("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", timeout=15) as resp:
@@ -285,21 +307,21 @@ async def poll_vulnerabilities(session):
 # 5. RSS Advisories, Research & Breaking Disclosures
 async def poll_rss_streams():
     rss_catalog = [
-        # National CERT Advisories (Blue - 0x2980B9)
+        # National CERT Advisories (Blue)
         ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡️ Government Advisory", 0x2980B9),
         ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡️ Government Advisory", 0x2980B9),
         ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡️ Government Advisory", 0x2980B9),
         ("CERT-EU", "https://cert.europa.eu/publications/security-advisories/rss.xml", "🛡️ Government Advisory", 0x2980B9),
         ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡️ Government Advisory", 0x2980B9),
-        # Industrial Control Systems / SCADA (Rust - 0xD35400)
+        # Industrial Control Systems
         ("CISA ICS", "https://www.cisa.gov/rss/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400),
-        # Critical CVE Stream (Orange - 0xE67E22)
+        # Critical CVE Stream
         ("AssureStart CVE", "https://cve.assurestart.co/api/feed.xml?cvss_min=9", "🦠 Vulnerability Alert", 0xE67E22),
-        # Threat Research, Taxonomy & Operations (Teal / Purple)
+        # Threat Research, Taxonomy & Operations
         ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C),
         ("Malpedia", "https://malpedia.caad.fkie.fraunhofer.de/rss", "🧬 Threat Actor Taxonomy Update", 0x8E44AD),
         ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB),
-        # Incident Reports & Breaking News (Green - 0x2ECC71)
+        # Incident Reports & Breaking News
         ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71),
         ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71)
     ]
