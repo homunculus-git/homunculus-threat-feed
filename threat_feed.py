@@ -42,13 +42,9 @@ def clean_html_to_markdown(raw_html: str) -> str:
     """Converts HTML links into Discord Markdown and strips raw HTML tags."""
     if not raw_html:
         return ""
-    # Decode HTML entities
     text = html.unescape(raw_html)
-    # Convert <a href="URL">TEXT</a> to [TEXT](URL)
     text = re.sub(r'<a\s+(?:[^>]*?\s+)?href="([^"]*)"[^>]*>(.*?)</a>', r'[\2](\1)', text, flags=re.IGNORECASE)
-    # Remove remaining HTML tags
     text = re.sub(r'<[^>]+>', ' ', text)
-    # Normalize whitespaces
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -143,7 +139,7 @@ async def poll_leak_trackers(session):
 
 # 2. C2 & Malicious Infrastructure (Yellow / Orange / Purple)
 async def poll_infrastructure(session):
-    # Feodo Tracker
+    # Feodo Tracker (Botnet C2s)
     try:
         async with session.get("https://feodotracker.abuse.ch/downloads/ipblocklist_recent.json", timeout=15) as resp:
             if resp.status == 200:
@@ -159,7 +155,7 @@ async def poll_infrastructure(session):
                                 {"name": "Host", "value": f"`{ip}:{port}`", "inline": True},
                                 {"name": "Family", "value": f"`{malware}`", "inline": True}
                             ],
-                            color=0xF1C40F
+                            color=0xF1C40F  # Yellow
                         )
     except Exception as e:
         print(f"[Collector Error] Feodo: {e}")
@@ -184,7 +180,7 @@ async def poll_infrastructure(session):
                                     {"name": "Host", "value": f"`{c2_ip}`", "inline": True},
                                     {"name": "Type", "value": f"`{c2_type}`", "inline": True}
                                 ],
-                                color=0xF1C40F
+                                color=0xF1C40F  # Yellow
                             )
     except Exception as e:
         print(f"[Collector Error] ThreatMon C2: {e}")
@@ -208,7 +204,7 @@ async def poll_infrastructure(session):
                                     {"name": "Defanged Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
                                     {"name": "Tags", "value": f"`{tags}`", "inline": True}
                                 ],
-                                color=0xE67E22
+                                color=0xE67E22  # Orange
                             )
     except Exception as e:
         print(f"[Collector Error] URLhaus: {e}")
@@ -228,12 +224,41 @@ async def poll_infrastructure(session):
                                 fields=[
                                     {"name": "Defanged Link", "value": f"`{defang_url(raw_link.strip())[:150]}`", "inline": False}
                                 ],
-                                color=0x9B59B6
+                                color=0x9B59B6  # Purple
                             )
     except Exception as e:
         print(f"[Collector Error] OpenPhish: {e}")
 
-# 3. Actively Exploited CVEs (Orange - 0xE67E22)
+# 3. Live Malware Binaries (abuse.ch MalwareBazaar - Grey 0x95A5A6)
+async def poll_malware_bazaar(session):
+    url = "https://mb-api.abuse.ch/api/v1/"
+    data = {"query": "get_recent", "selector": "10"}
+    try:
+        async with session.post(url, data=data, timeout=15) as resp:
+            if resp.status == 200:
+                body = await resp.json()
+                if body.get("query_status") == "ok":
+                    for sample in body.get("data", [])[:3]:
+                        sha256 = sample.get("sha256_hash")
+                        malware = sample.get("signature") or "Unclassified Malware"
+                        file_type = sample.get("file_type", "Executable")
+                        event_id = f"bazaar_{sha256}"
+                        if not is_duplicate(event_id):
+                            record_event(event_id, "MalwareBazaar")
+                            dispatch_discord_embed(
+                                title=f"🔬 New Malware Sample: {malware}",
+                                description=f"A fresh `{file_type}` payload was staged and identified.",
+                                fields=[
+                                    {"name": "Signature", "value": f"`{malware}`", "inline": True},
+                                    {"name": "File Type", "value": f"`{file_type}`", "inline": True},
+                                    {"name": "SHA256", "value": f"`{sha256[:20]}...`", "inline": False}
+                                ],
+                                color=0x95A5A6  # Grey
+                            )
+    except Exception as e:
+        print(f"[Collector Error] MalwareBazaar: {e}")
+
+# 4. Actively Exploited CVEs (Orange - 0xE67E22)
 async def poll_vulnerabilities(session):
     try:
         async with session.get("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", timeout=15) as resp:
@@ -257,18 +282,24 @@ async def poll_vulnerabilities(session):
     except Exception as e:
         print(f"[Collector Error] CISA KEV: {e}")
 
-# 4. RSS Advisories, Research & Breaking Disclosures
+# 5. RSS Advisories, Research & Breaking Disclosures
 async def poll_rss_streams():
     rss_catalog = [
         # National CERT Advisories (Blue - 0x2980B9)
         ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡️ Government Advisory", 0x2980B9),
         ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡️ Government Advisory", 0x2980B9),
         ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡️ Government Advisory", 0x2980B9),
+        ("CERT-EU", "https://cert.europa.eu/publications/security-advisories/rss.xml", "🛡️ Government Advisory", 0x2980B9),
+        ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡️ Government Advisory", 0x2980B9),
+        # Industrial Control Systems / SCADA (Rust - 0xD35400)
+        ("CISA ICS", "https://www.cisa.gov/rss/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400),
         # Critical CVE Stream (Orange - 0xE67E22)
         ("AssureStart CVE", "https://cve.assurestart.co/api/feed.xml?cvss_min=9", "🦠 Vulnerability Alert", 0xE67E22),
-        # Threat Research & APTs (Teal - 0x1ABC9C)
+        # Threat Research, Taxonomy & Operations (Teal / Purple)
         ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C),
-        # Incident Reports & News (Green - 0x2ECC71)
+        ("Malpedia", "https://malpedia.caad.fkie.fraunhofer.de/rss", "🧬 Threat Actor Taxonomy Update", 0x8E44AD),
+        ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB),
+        # Incident Reports & Breaking News (Green - 0x2ECC71)
         ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71),
         ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71)
     ]
@@ -296,12 +327,13 @@ async def poll_rss_streams():
 # --- ORCHESTRATION ---
 
 async def main():
-    print("[*] Homunculus 15-Source Threat Intelligence Engine Active.")
+    print("[*] Homunculus 21-Source Threat Intelligence Engine Active.")
     while True:
         async with aiohttp.ClientSession() as session:
             await asyncio.gather(
                 poll_leak_trackers(session),
                 poll_infrastructure(session),
+                poll_malware_bazaar(session),
                 poll_vulnerabilities(session),
                 poll_rss_streams(),
                 return_exceptions=True
