@@ -3,6 +3,7 @@ import re
 import csv
 import io
 import html
+import base64
 import sqlite3
 import asyncio
 import aiohttp
@@ -49,6 +50,11 @@ def record_event(event_id: str, source: str):
 
 def defang_url(url: str) -> str:
     return url.replace("http://", "hxxp://").replace("https://", "hxxps://").replace(".", "[.]")
+
+def get_virustotal_url_link(raw_url: str) -> str:
+    """Generates the official unpadded URL-safe Base64 identifier required by VirusTotal."""
+    vt_id = base64.urlsafe_b64encode(raw_url.encode()).decode().strip("=")
+    return f"https://www.virustotal.com/gui/url/{vt_id}"
 
 def clean_html_to_markdown(raw_html: str) -> str:
     if not raw_html:
@@ -156,7 +162,7 @@ async def poll_leak_trackers(session):
 
 # 2. C2, Botnets, Malicious SSL & Infrastructure
 async def poll_infrastructure(session):
-    # Feodo Tracker (Botnet C2s)
+    # Feodo Tracker
     try:
         async with session.get("https://feodotracker.abuse.ch/downloads/ipblocklist_recent.json", timeout=15) as resp:
             if resp.status == 200:
@@ -177,7 +183,7 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] Feodo: {e}")
 
-    # abuse.ch SSLBL (Malicious SSL Certificate IP Blacklist)
+    # abuse.ch SSLBL
     try:
         async with session.get("https://sslbl.abuse.ch/blacklist/sslipblacklist.csv", timeout=15) as resp:
             if resp.status == 200:
@@ -198,7 +204,7 @@ async def poll_infrastructure(session):
                                     {"name": "First Seen (UTC)", "value": seen_time, "inline": True},
                                     {"name": "Infrastructure Profile", "value": f"[Investigate IP on VirusTotal]({vt_ip_url})", "inline": False}
                                 ],
-                                color=0xD35400  # Dark Orange
+                                color=0xD35400
                             )
     except Exception as e:
         print(f"[Collector Error] SSLBL: {e}")
@@ -228,7 +234,7 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] ThreatMon: {e}")
 
-    # URLhaus Droppers
+    # URLhaus Droppers (Fixed VirusTotal link generation)
     try:
         async with session.get("https://urlhaus.abuse.ch/downloads/csv_recent/", timeout=15) as resp:
             if resp.status == 200:
@@ -236,26 +242,29 @@ async def poll_infrastructure(session):
                 reader = csv.reader([line for line in text.splitlines() if not line.startswith("#")])
                 for row in list(reader)[:3]:
                     if len(row) > 6:
-                        raw_url, threat, tags = row[2], row[5], row[6]
-                        event_id = f"urlhaus_{row[0]}"
+                        url_id, raw_url, threat, tags = row[0].strip(), row[2].strip(), row[5].strip(), row[6].strip()
+                        event_id = f"urlhaus_{url_id}"
                         if not is_duplicate(event_id):
                             record_event(event_id, "URLhaus")
-                            encoded_target = urllib.parse.quote(raw_url, safe='')
-                            vt_url = f"https://www.virustotal.com/gui/search/{encoded_target}"
+                            vt_url = get_virustotal_url_link(raw_url)
+                            urlscan_search = f"https://urlscan.io/search/#page.url:%22{urllib.parse.quote(raw_url, safe='')}%22"
+                            urlhaus_dossier = f"https://urlhaus.abuse.ch/url/{url_id}/"
+                            
                             dispatch_discord_embed(
                                 title=f"☣️ Malware Dropper: {threat}",
-                                description="Payload distribution URL detected in live attacks.",
+                                description="Payload distribution URL detected in active malware campaigns.",
                                 fields=[
-                                    {"name": "Defanged Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
-                                    {"name": "Tags", "value": f"`{tags}`", "inline": True},
-                                    {"name": "Sandbox Check", "value": f"[Scan on VirusTotal]({vt_url})", "inline": False}
+                                    {"name": "Defanged Payload Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
+                                    {"name": "Campaign Tags", "value": f"`{tags or 'None'}`", "inline": True},
+                                    {"name": "Threat Database", "value": f"[View URLhaus Dossier]({urlhaus_dossier})", "inline": True},
+                                    {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Search on URLScan.io]({urlscan_search})", "inline": False}
                                 ],
                                 color=0xE67E22
                             )
     except Exception as e:
         print(f"[Collector Error] URLhaus: {e}")
 
-    # OpenPhish with direct VirusTotal & URLScan sandboxes
+    # OpenPhish (Fixed VirusTotal link generation)
     try:
         async with session.get("https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt", timeout=15) as resp:
             if resp.status == 200:
@@ -265,9 +274,8 @@ async def poll_infrastructure(session):
                         event_id = f"phish_{hash(link)}"
                         if not is_duplicate(event_id):
                             record_event(event_id, "OpenPhish")
-                            encoded_target = urllib.parse.quote(link, safe='')
-                            vt_url = f"https://www.virustotal.com/gui/search/{encoded_target}"
-                            urlscan_search = f"https://urlscan.io/search/#page.url:%22{encoded_target}%22"
+                            vt_url = get_virustotal_url_link(link)
+                            urlscan_search = f"https://urlscan.io/search/#page.url:%22{urllib.parse.quote(link, safe='')}%22"
                             dispatch_discord_embed(
                                 title="🎣 Malicious Infrastructure: Phishing Site",
                                 description="Credential harvest target identified in live circulation.",
@@ -338,25 +346,19 @@ async def poll_vulnerabilities(session):
 # 5. RSS Feeds: Government Advisories, Exploits, Research & Incident News
 async def poll_rss_streams():
     rss_catalog = [
-        # National CERT Advisories (Blue - 0x2980B9)
         ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡️ Government Advisory", 0x2980B9, False),
         ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡️ Government Advisory", 0x2980B9, False),
         ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡️ Government Advisory", 0x2980B9, True),
         ("CERT-EU", "https://cert.europa.eu/publications/security-advisories/rss.xml", "🛡️ Government Advisory", 0x2980B9, False),
         ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡️ Government Advisory", 0x2980B9, True),
         ("CERT NZ", "https://www.cert.govt.nz/it-specialists/advisories/rss", "🛡️ Government Advisory", 0x2980B9, False),
-        # Industrial Control Systems (Rust - 0xD35400)
         ("CISA ICS", "https://www.cisa.gov/rss/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400, False),
-        # Weaponized Exploit PoCs (Hot Pink - 0xE91E63)
         ("Exploit-DB", "https://www.exploit-db.com/rss.xml", "💥 Exploit PoC Alert", 0xE91E63, False),
         ("Packet Storm", "https://packetstorm.news/rss/files", "💥 Exploit PoC Alert", 0xE91E63, False),
-        # Critical CVE Stream (Orange - 0xE67E22)
         ("AssureStart CVE", "https://cve.assurestart.co/api/feed.xml?cvss_min=9", "🦠 Vulnerability Alert", 0xE67E22, False),
-        # Threat Research, Taxonomy & Operations
         ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C, False),
         ("Malpedia", "https://malpedia.caad.fkie.fraunhofer.de/rss", "🧬 Threat Actor Taxonomy Update", 0x8E44AD, False),
         ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB, False),
-        # Incident Reports & Breaking News (Green - 0x2ECC71)
         ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71, False),
         ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71, False)
     ]
