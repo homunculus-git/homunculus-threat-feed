@@ -80,6 +80,7 @@ def dispatch_discord_embed(title: str, description: str, fields: list, color: in
 
 # --- COLLECTOR TASKS ---
 
+# 1. Dark Web Ransomware Leak Trackers (Red - 0xE74C3C)
 async def poll_leak_trackers(session):
     try:
         async with session.get("https://api.ransomware.live/v2/recentvictims", timeout=15) as resp:
@@ -153,7 +154,9 @@ async def poll_leak_trackers(session):
     except Exception as e:
         print(f"[Collector Error] Ransomwatch: {e}")
 
+# 2. C2, Botnets, Malicious SSL & Infrastructure
 async def poll_infrastructure(session):
+    # Feodo Tracker (Botnet C2s)
     try:
         async with session.get("https://feodotracker.abuse.ch/downloads/ipblocklist_recent.json", timeout=15) as resp:
             if resp.status == 200:
@@ -174,6 +177,33 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] Feodo: {e}")
 
+    # abuse.ch SSLBL (Malicious SSL Certificate IP Blacklist)
+    try:
+        async with session.get("https://sslbl.abuse.ch/blacklist/sslipblacklist.csv", timeout=15) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+                reader = csv.reader([line for line in text.splitlines() if not line.startswith("#")])
+                for row in list(reader)[:4]:
+                    if len(row) >= 3:
+                        seen_time, bad_ip, bad_port = row[0].strip(), row[1].strip(), row[2].strip()
+                        event_id = f"sslbl_{bad_ip}_{bad_port}"
+                        if not is_duplicate(event_id):
+                            record_event(event_id, "abuse.ch SSLBL")
+                            vt_ip_url = f"https://www.virustotal.com/gui/ip-address/{bad_ip}"
+                            dispatch_discord_embed(
+                                title="🔒 Malicious SSL Infrastructure: Botnet Node",
+                                description="Host operating a blacklisted SSL/TLS certificate associated with malware C2.",
+                                fields=[
+                                    {"name": "Server Endpoint", "value": f"`{bad_ip}:{bad_port}`", "inline": True},
+                                    {"name": "First Seen (UTC)", "value": seen_time, "inline": True},
+                                    {"name": "Infrastructure Profile", "value": f"[Investigate IP on VirusTotal]({vt_ip_url})", "inline": False}
+                                ],
+                                color=0xD35400  # Dark Orange
+                            )
+    except Exception as e:
+        print(f"[Collector Error] SSLBL: {e}")
+
+    # ThreatMon Daily C2 Feed
     try:
         async with session.get("https://raw.githubusercontent.com/ThreatMon/ThreatMon-Daily-C2-Feeds/main/daily-c2.csv", timeout=15) as resp:
             if resp.status == 200:
@@ -198,6 +228,7 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] ThreatMon: {e}")
 
+    # URLhaus Droppers
     try:
         async with session.get("https://urlhaus.abuse.ch/downloads/csv_recent/", timeout=15) as resp:
             if resp.status == 200:
@@ -224,7 +255,7 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] URLhaus: {e}")
 
-    # OpenPhish with direct VirusTotal and URLScan sandbox links
+    # OpenPhish with direct VirusTotal & URLScan sandboxes
     try:
         async with session.get("https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt", timeout=15) as resp:
             if resp.status == 200:
@@ -234,11 +265,9 @@ async def poll_infrastructure(session):
                         event_id = f"phish_{hash(link)}"
                         if not is_duplicate(event_id):
                             record_event(event_id, "OpenPhish")
-                            
                             encoded_target = urllib.parse.quote(link, safe='')
                             vt_url = f"https://www.virustotal.com/gui/search/{encoded_target}"
                             urlscan_search = f"https://urlscan.io/search/#page.url:%22{encoded_target}%22"
-
                             dispatch_discord_embed(
                                 title="🎣 Malicious Infrastructure: Phishing Site",
                                 description="Credential harvest target identified in live circulation.",
@@ -251,6 +280,7 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] OpenPhish: {e}")
 
+# 3. Live Malware Binaries (MalwareBazaar)
 async def poll_malware_bazaar(session):
     url = "https://mb-api.abuse.ch/api/v1/"
     data = {"query": "get_recent", "selector": "10"}
@@ -281,6 +311,7 @@ async def poll_malware_bazaar(session):
     except Exception as e:
         print(f"[Collector Error] MalwareBazaar: {e}")
 
+# 4. Actively Exploited CVEs (CISA KEV)
 async def poll_vulnerabilities(session):
     try:
         async with session.get("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", timeout=15) as resp:
@@ -304,18 +335,28 @@ async def poll_vulnerabilities(session):
     except Exception as e:
         print(f"[Collector Error] CISA KEV: {e}")
 
+# 5. RSS Feeds: Government Advisories, Exploits, Research & Incident News
 async def poll_rss_streams():
     rss_catalog = [
+        # National CERT Advisories (Blue - 0x2980B9)
         ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡️ Government Advisory", 0x2980B9, False),
         ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡️ Government Advisory", 0x2980B9, False),
         ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡️ Government Advisory", 0x2980B9, True),
         ("CERT-EU", "https://cert.europa.eu/publications/security-advisories/rss.xml", "🛡️ Government Advisory", 0x2980B9, False),
         ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡️ Government Advisory", 0x2980B9, True),
+        ("CERT NZ", "https://www.cert.govt.nz/it-specialists/advisories/rss", "🛡️ Government Advisory", 0x2980B9, False),
+        # Industrial Control Systems (Rust - 0xD35400)
         ("CISA ICS", "https://www.cisa.gov/rss/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400, False),
+        # Weaponized Exploit PoCs (Hot Pink - 0xE91E63)
+        ("Exploit-DB", "https://www.exploit-db.com/rss.xml", "💥 Exploit PoC Alert", 0xE91E63, False),
+        ("Packet Storm", "https://packetstorm.news/rss/files", "💥 Exploit PoC Alert", 0xE91E63, False),
+        # Critical CVE Stream (Orange - 0xE67E22)
         ("AssureStart CVE", "https://cve.assurestart.co/api/feed.xml?cvss_min=9", "🦠 Vulnerability Alert", 0xE67E22, False),
+        # Threat Research, Taxonomy & Operations
         ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C, False),
         ("Malpedia", "https://malpedia.caad.fkie.fraunhofer.de/rss", "🧬 Threat Actor Taxonomy Update", 0x8E44AD, False),
         ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB, False),
+        # Incident Reports & Breaking News (Green - 0x2ECC71)
         ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71, False),
         ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71, False)
     ]
@@ -349,8 +390,10 @@ async def poll_rss_streams():
         except Exception as e:
             print(f"[RSS Error] {publisher}: {e}")
 
+# --- ORCHESTRATION ---
+
 async def main():
-    print("[*] Homunculus 21-Source Multilingual Threat Engine Active.")
+    print("[*] Homunculus 25-Source Threat Intelligence Stream Running.")
     while True:
         async with aiohttp.ClientSession() as session:
             await asyncio.gather(
