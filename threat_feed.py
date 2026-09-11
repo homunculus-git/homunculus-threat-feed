@@ -52,7 +52,6 @@ def defang_url(url: str) -> str:
     return url.replace("http://", "hxxp://").replace("https://", "hxxps://").replace(".", "[.]")
 
 def get_virustotal_url_link(raw_url: str) -> str:
-    """Generates the official unpadded URL-safe Base64 identifier required by VirusTotal."""
     vt_id = base64.urlsafe_b64encode(raw_url.encode()).decode().strip("=")
     return f"https://www.virustotal.com/gui/url/{vt_id}"
 
@@ -64,6 +63,39 @@ def clean_html_to_markdown(raw_html: str) -> str:
     text = re.sub(r'<[^>]+>', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+def extract_malware_family(raw_tags: str) -> str:
+    """Extracts high-fidelity malware family or botnet name from URLhaus campaign tags."""
+    if not raw_tags or raw_tags.strip() == "None":
+        return "Unclassified Dropper"
+    
+    tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+    
+    # Check for direct 'dropped-by-<family>' attribution
+    for tag in tags:
+        if tag.lower().startswith("dropped-by-"):
+            return tag.split("-")[-1].capitalize()
+    
+    # Generic operational terms to filter out
+    generic_noise = {"exe", "elf", "dll", "sh", "bin", "zip", "32-bit", "64-bit", "plugin", "arm", "mips", "x86"}
+    
+    # Look for well-known malware families
+    known_families = {
+        "amadey", "mirai", "gafgyt", "redline", "stealc", "lumma", "vidar", 
+        "asyncrat", "agenttesla", "remcos", "qakbot", "icedid", "cobaltstrike",
+        "njrat", "guploader", "smoke loader", "danabot", "meduzastealer"
+    }
+    
+    for tag in tags:
+        if tag.lower() in known_families:
+            return tag.capitalize()
+            
+    # Fallback to the first non-generic tag if available
+    for tag in tags:
+        if tag.lower() not in generic_noise and not tag.endswith(".dll") and not tag.endswith(".exe"):
+            return tag.capitalize()
+            
+    return "Malware Payload"
 
 def dispatch_discord_embed(title: str, description: str, fields: list, color: int, image_url: str = None):
     if not DISCORD_WEBHOOK or "discord.com" not in DISCORD_WEBHOOK:
@@ -86,7 +118,7 @@ def dispatch_discord_embed(title: str, description: str, fields: list, color: in
 
 # --- COLLECTOR TASKS ---
 
-# 1. Dark Web Ransomware Leak Trackers (Red - 0xE74C3C)
+# 1. Dark Web Ransomware Leak Trackers
 async def poll_leak_trackers(session):
     try:
         async with session.get("https://api.ransomware.live/v2/recentvictims", timeout=15) as resp:
@@ -234,7 +266,7 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] ThreatMon: {e}")
 
-    # URLhaus Droppers (Fixed VirusTotal link generation)
+    # URLhaus Droppers (With Intelligent Family Extraction)
     try:
         async with session.get("https://urlhaus.abuse.ch/downloads/csv_recent/", timeout=15) as resp:
             if resp.status == 200:
@@ -246,17 +278,22 @@ async def poll_infrastructure(session):
                         event_id = f"urlhaus_{url_id}"
                         if not is_duplicate(event_id):
                             record_event(event_id, "URLhaus")
+                            
+                            # Identify specific botnet/malware family from tags
+                            detected_family = extract_malware_family(tags)
+                            
                             vt_url = get_virustotal_url_link(raw_url)
                             urlscan_search = f"https://urlscan.io/search/#page.url:%22{urllib.parse.quote(raw_url, safe='')}%22"
                             urlhaus_dossier = f"https://urlhaus.abuse.ch/url/{url_id}/"
                             
                             dispatch_discord_embed(
-                                title=f"☣️ Malware Dropper: {threat}",
-                                description="Payload distribution URL detected in active malware campaigns.",
+                                title=f"☣️ Malware Dropper: {detected_family}",
+                                description="Payload distribution URL detected in live malware campaigns.",
                                 fields=[
-                                    {"name": "Defanged Payload Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
-                                    {"name": "Campaign Tags", "value": f"`{tags or 'None'}`", "inline": True},
+                                    {"name": "Malware / Botnet Family", "value": f"**{detected_family}**", "inline": True},
                                     {"name": "Threat Database", "value": f"[View URLhaus Dossier]({urlhaus_dossier})", "inline": True},
+                                    {"name": "Campaign Tags", "value": f"`{tags or 'None'}`", "inline": False},
+                                    {"name": "Defanged Payload Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
                                     {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Search on URLScan.io]({urlscan_search})", "inline": False}
                                 ],
                                 color=0xE67E22
@@ -264,7 +301,7 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] URLhaus: {e}")
 
-    # OpenPhish (Fixed VirusTotal link generation)
+    # OpenPhish
     try:
         async with session.get("https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt", timeout=15) as resp:
             if resp.status == 200:
@@ -343,7 +380,7 @@ async def poll_vulnerabilities(session):
     except Exception as e:
         print(f"[Collector Error] CISA KEV: {e}")
 
-# 5. RSS Feeds: Government Advisories, Exploits, Research & Incident News
+# 5. RSS Feeds
 async def poll_rss_streams():
     rss_catalog = [
         ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡️ Government Advisory", 0x2980B9, False),
