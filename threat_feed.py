@@ -71,6 +71,48 @@ def normalize_leak_event_id(group: str, victim: str) -> str:
     clean_victim = re.sub(r'[^a-z0-9]', '', (victim or "").lower())
     return f"victim_{clean_group}_{clean_victim}"
 
+# --- MITRE ATT&CK & THREAT ACTOR ENRICHMENT ENGINES ---
+
+KNOWN_MITRE_GROUPS = {
+    "lockbit": ("G0092", "LockBit"),
+    "clop": ("G0096", "CL0P"),
+    "cl0p": ("G0096", "CL0P"),
+    "blackcat": ("G1017", "BlackCat"),
+    "alphv": ("G1017", "BlackCat (ALPHV)"),
+    "play": ("G1019", "Play"),
+    "akira": ("G1024", "Akira"),
+    "blackbasta": ("G1011", "Black Basta"),
+    "qilin": ("G1036", "Qilin"),
+    "rhysida": ("G1035", "Rhysida"),
+    "bianlian": ("G1005", "BianLian"),
+    "medusa": ("G1028", "Medusa"),
+    "8base": ("G1030", "8Base"),
+    "incransom": ("G1037", "Inc Ransom"),
+    "ransomhub": ("G1040", "RansomHub"),
+    "lazarus": ("G0032", "Lazarus Group"),
+    "apt29": ("G0016", "APT29 (Cozy Bear)"),
+    "apt28": ("G0007", "APT28 (Fancy Bear)"),
+    "scatteredspider": ("G1015", "Scattered Spider")
+}
+
+def get_threat_actor_dossier_links(actor_name: str) -> str:
+    """Generates direct intelligence dossier links (MITRE ATT&CK Group + Malpedia Profile)."""
+    if not actor_name or actor_name.lower() in ("unknown", "unspecified", "anonymous"):
+        return f"`{actor_name or 'Unattributed'}`"
+    
+    slug = re.sub(r'[^a-z0-9]', '', actor_name.lower())
+    links = []
+    
+    if slug in KNOWN_MITRE_GROUPS:
+        gid, _ = KNOWN_MITRE_GROUPS[slug]
+        links.append(f"[MITRE {gid}](https://attack.mitre.org/groups/{gid}/)")
+    else:
+        search_query = urllib.parse.quote(actor_name)
+        links.append(f"[Search MITRE](https://attack.mitre.org/?q={search_query})")
+    
+    links.append(f"[Malpedia Dossier](https://malpedia.caad.fkie.fraunhofer.de/details/actor.{slug})")
+    return f"**{actor_name}** • " + " | ".join(links)
+
 async def resolve_host_metadata(session, raw_url: str) -> dict:
     """Passively resolves domain IP and ASN hosting provider without visiting the site."""
     try:
@@ -141,15 +183,20 @@ def extract_malware_family(raw_tags: str) -> str:
             
     return "Malware Payload"
 
-def dispatch_discord_embed(title: str, description: str, fields: list, color: int, image_url: str = None):
+def dispatch_discord_embed(title: str, description: str, fields: list, color: int, image_url: str = None, mitre_tactics: str = None):
     if not DISCORD_WEBHOOK or "discord.com" not in DISCORD_WEBHOOK:
         return
+    
+    footer_text = "Homunculus CTI Core • Automated Threat Stream"
+    if mitre_tactics:
+        footer_text = f"ATT&CK: {mitre_tactics} • {footer_text}"
+        
     embed = {
         "title": title[:256],
         "description": description[:2000],
         "color": color,
         "fields": fields,
-        "footer": {"text": "Homunculus CTI Core • Automated Threat Stream"}
+        "footer": {"text": footer_text}
     }
     if image_url and image_url.startswith("http"):
         embed["image"] = {"url": image_url}
@@ -162,7 +209,7 @@ def dispatch_discord_embed(title: str, description: str, fields: list, color: in
 
 # --- COLLECTOR TASKS ---
 
-# 1. Dark Web Ransomware Leak Trackers (Cross-Deduplicated)
+# 1. Dark Web Ransomware Leak Trackers (Cross-Deduplicated + Dossier Linked)
 async def poll_leak_trackers(session):
     # Ransomware.live
     try:
@@ -176,8 +223,10 @@ async def poll_leak_trackers(session):
                         record_event(event_id, "Ransomware.live")
                         note_text = v.get("description") or "No detailed extortion note disclosed."
                         clean_note = clean_html_to_markdown(note_text)[:450]
+                        actor_dossier = get_threat_actor_dossier_links(group)
+                        
                         fields = [
-                            {"name": "Threat Actor", "value": f"`{group}`", "inline": True},
+                            {"name": "Threat Actor Dossier", "value": actor_dossier, "inline": False},
                             {"name": "Target Country", "value": v.get("country", "Global"), "inline": True},
                             {"name": "Data Claimed", "value": v.get("data_size") or "Unspecified", "inline": True}
                         ]
@@ -189,7 +238,8 @@ async def poll_leak_trackers(session):
                             description=f"**Extortion Notice / Group Claim:**\n>>> {clean_note}",
                             fields=fields,
                             color=0xE74C3C,
-                            image_url=v.get("screenshot")
+                            image_url=v.get("screenshot"),
+                            mitre_tactics="T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service"
                         )
     except Exception as e:
         print(f"[Collector Error] Ransomware.live: {e}")
@@ -205,14 +255,16 @@ async def poll_leak_trackers(session):
                     if not is_duplicate(event_id):
                         record_event(event_id, "RansomLook")
                         desc = post.get("description") or "Target listed on double-extortion leak directory."
+                        actor_dossier = get_threat_actor_dossier_links(group)
                         dispatch_discord_embed(
                             title=f"🚨 Ransomware Alert: {victim}",
                             description=f"**Extortion Claim:**\n>>> {clean_html_to_markdown(desc)[:350]}",
                             fields=[
-                                {"name": "Threat Actor", "value": f"`{group}`", "inline": True},
+                                {"name": "Threat Actor Dossier", "value": actor_dossier, "inline": False},
                                 {"name": "Source", "value": "RansomLook API", "inline": True}
                             ],
-                            color=0xE74C3C
+                            color=0xE74C3C,
+                            mitre_tactics="T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service"
                         )
     except Exception as e:
         print(f"[Collector Error] RansomLook: {e}")
@@ -227,14 +279,16 @@ async def poll_leak_trackers(session):
                     event_id = normalize_leak_event_id(group, victim)
                     if not is_duplicate(event_id):
                         record_event(event_id, "Ransomwatch")
+                        actor_dossier = get_threat_actor_dossier_links(group)
                         dispatch_discord_embed(
                             title=f"🚨 Ransomware Alert: {victim}",
                             description=f"Automated crawler detected fresh victim published on **{group}**'s leak site.",
                             fields=[
-                                {"name": "Threat Actor", "value": f"`{group}`", "inline": True},
+                                {"name": "Threat Actor Dossier", "value": actor_dossier, "inline": False},
                                 {"name": "Source", "value": "Ransomwatch Git Data", "inline": True}
                             ],
-                            color=0xE74C3C
+                            color=0xE74C3C,
+                            mitre_tactics="T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service"
                         )
     except Exception as e:
         print(f"[Collector Error] Ransomwatch: {e}")
@@ -257,7 +311,8 @@ async def poll_infrastructure(session):
                                 {"name": "Host", "value": f"`{ip}:{port}`", "inline": True},
                                 {"name": "Family", "value": f"`{malware}`", "inline": True}
                             ],
-                            color=0xF1C40F
+                            color=0xF1C40F,
+                            mitre_tactics="T1071 Application Layer Protocol • T1573 Encrypted Channel"
                         )
     except Exception as e:
         print(f"[Collector Error] Feodo: {e}")
@@ -283,7 +338,8 @@ async def poll_infrastructure(session):
                                     {"name": "First Seen (UTC)", "value": seen_time, "inline": True},
                                     {"name": "Infrastructure Profile", "value": f"[Investigate IP on VirusTotal]({vt_ip_url})", "inline": False}
                                 ],
-                                color=0xD35400
+                                color=0xD35400,
+                                mitre_tactics="T1573.002 Asymmetric Cryptography • T1071.001 Web Protocols"
                             )
     except Exception as e:
         print(f"[Collector Error] SSLBL: {e}")
@@ -308,7 +364,8 @@ async def poll_infrastructure(session):
                                     {"name": "Host", "value": f"`{c2_ip}`", "inline": True},
                                     {"name": "Type", "value": f"`{c2_type}`", "inline": True}
                                 ],
-                                color=0xF1C40F
+                                color=0xF1C40F,
+                                mitre_tactics="T1071 Application Layer Protocol"
                             )
     except Exception as e:
         print(f"[Collector Error] ThreatMon: {e}")
@@ -340,7 +397,8 @@ async def poll_infrastructure(session):
                                     {"name": "Defanged Payload Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
                                     {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Search on URLScan.io]({urlscan_search})", "inline": False}
                                 ],
-                                color=0xE67E22
+                                color=0xE67E22,
+                                mitre_tactics="T1204.001 Malicious Link • T1105 Ingress Tool Transfer"
                             )
     except Exception as e:
         print(f"[Collector Error] URLhaus: {e}")
@@ -371,7 +429,8 @@ async def poll_infrastructure(session):
                                     {"name": "Defanged Link", "value": f"`{defang_url(link)[:120]}`", "inline": False},
                                     {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Search on URLScan.io]({urlscan_search})", "inline": False}
                                 ],
-                                color=0x9B59B6
+                                color=0x9B59B6,
+                                mitre_tactics="T1566.002 Spearphishing Link • T1056.003 Web Portal Capture"
                             )
     except Exception as e:
         print(f"[Collector Error] OpenPhish: {e}")
@@ -413,7 +472,8 @@ async def poll_threatfox(session):
                                 title=f"🎯 Threat Attribution: {malware}",
                                 description="Community intelligence indicator linked to active adversary campaign.",
                                 fields=fields,
-                                color=0x8E44AD
+                                color=0x8E44AD,
+                                mitre_tactics="T1071 C2 Protocols • T1584 Compromise Infrastructure"
                             )
     except Exception as e:
         print(f"[Collector Error] ThreatFox: {e}")
@@ -444,7 +504,8 @@ async def poll_malware_bazaar(session):
                                     {"name": "SHA256", "value": f"`{sha256[:20]}...`", "inline": False},
                                     {"name": "Hash Analysis", "value": f"[Inspect Binary on VirusTotal]({vt_hash_url})", "inline": False}
                                 ],
-                                color=0x95A5A6
+                                color=0x95A5A6,
+                                mitre_tactics="T1204 User Execution • T1027 Obfuscated Files"
                             )
     except Exception as e:
         print(f"[Collector Error] MalwareBazaar: {e}")
@@ -468,7 +529,8 @@ async def poll_vulnerabilities(session):
                                 {"name": "Ransomware Link", "value": f"**{is_ransom}**", "inline": True},
                                 {"name": "Required Action", "value": vuln.get("requiredAction", "Patch immediately"), "inline": False}
                             ],
-                            color=0xE67E22
+                            color=0xE67E22,
+                            mitre_tactics="T1190 Exploit Public-Facing Application"
                         )
     except Exception as e:
         print(f"[Collector Error] CISA KEV: {e}")
@@ -509,7 +571,8 @@ async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color,
                         {"name": "Publisher", "value": publisher, "inline": True},
                         {"name": "Details", "value": f"[Open Document / Article]({entry.link})", "inline": False}
                     ],
-                    color=color
+                    color=color,
+                    mitre_tactics="T1592 Gather Victim Host Info • T1595 Active Scanning" if "Advisory" in alert_type else "T1588 Obtain Capabilities"
                 )
     except asyncio.TimeoutError:
         pass
