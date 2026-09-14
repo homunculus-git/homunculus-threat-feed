@@ -18,17 +18,6 @@ load_dotenv()
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 
-# --- TRANSLATOR ENGINE ---
-translator = GoogleTranslator(source='auto', target='en')
-
-def translate_to_english(text: str) -> str:
-    if not text:
-        return ""
-    try:
-        return translator.translate(text)
-    except Exception:
-        return text
-
 # --- DATABASE PERSISTENCE (DEDUPLICATION) ---
 conn = sqlite3.connect("threat_cache.db")
 cursor = conn.cursor()
@@ -66,10 +55,36 @@ def clean_html_to_markdown(raw_html: str) -> str:
     return text
 
 def normalize_leak_event_id(group: str, victim: str) -> str:
-    """Unified cross-source normalization to eliminate duplicate dark web victim storms."""
     clean_group = re.sub(r'[^a-z0-9]', '', (group or "").lower())
     clean_victim = re.sub(r'[^a-z0-9]', '', (victim or "").lower())
     return f"victim_{clean_group}_{clean_victim}"
+
+# --- UNIVERSAL AUTO-TRANSLATOR ENGINE ---
+def _sync_translate_if_foreign(text: str) -> tuple[str, bool]:
+    """Translates text to English if foreign. Returns (translated_text, was_translated)."""
+    if not text or not text.strip():
+        return "", False
+    
+    # Strip bracketed metadata tags like [NEU] [mittel] that confuse translation models
+    cleaned = re.sub(r'\[.*?\]', '', text).strip()
+    sample = cleaned if len(cleaned) > 5 else text
+
+    try:
+        t = GoogleTranslator(source='auto', target='en')
+        translated = t.translate(sample)
+        # If the translation differs meaningfully from the original, it was foreign
+        if translated and translated.strip().lower() != sample.strip().lower():
+            return translated, True
+        return text, False
+    except Exception:
+        return text, False
+
+async def auto_translate_to_english(text: str) -> tuple[str, bool]:
+    """Asynchronously translates foreign content without blocking the event loop."""
+    if not text:
+        return "", False
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _sync_translate_if_foreign, text)
 
 # --- MITRE ATT&CK & THREAT ACTOR ENRICHMENT ENGINES ---
 
@@ -96,7 +111,6 @@ KNOWN_MITRE_GROUPS = {
 }
 
 def get_threat_actor_dossier_links(actor_name: str) -> str:
-    """Generates direct intelligence dossier links (MITRE ATT&CK Group + Malpedia Profile)."""
     if not actor_name or actor_name.lower() in ("unknown", "unspecified", "anonymous"):
         return f"`{actor_name or 'Unattributed'}`"
     
@@ -113,8 +127,39 @@ def get_threat_actor_dossier_links(actor_name: str) -> str:
     links.append(f"[Malpedia Dossier](https://malpedia.caad.fkie.fraunhofer.de/details/actor.{slug})")
     return f"**{actor_name}** • " + " | ".join(links)
 
+def classify_research_post(title: str, default_desc: str) -> tuple:
+    low = title.lower()
+    
+    if any(k in low for k in ["macos", "mac os", "osx", "amos", "shub"]):
+        platform = "Apple macOS"
+    elif any(k in low for k in ["linux", "elf", "mips", "arm"]):
+        platform = "Linux / Unix"
+    elif any(k in low for k in ["android", "apk", "ios"]):
+        platform = "Mobile Device"
+    else:
+        platform = "Microsoft Windows"
+        
+    if any(k in low for k in ["stealer", "infostealer", "amos", "vidar", "lumma", "stealc", "essential"]):
+        threat_type = "Credential & Infostealer"
+    elif any(k in low for k in ["rat", "xworm", "remcos", "njrat", "asyncrat", "agenttesla"]):
+        threat_type = "Remote Access Trojan (RAT)"
+    elif any(k in low for k in ["botnet", "mirai", "gafgyt"]):
+        threat_type = "Botnet DDoS Node"
+    elif any(k in low for k in ["exercise", "traffic analysis"]):
+        threat_type = "Traffic Analysis & PCAP Exercise"
+    else:
+        threat_type = "Malware Infection Chain"
+        
+    desc = default_desc
+    if not desc or len(desc.strip()) < 15 or desc.strip() == title.strip():
+        desc = (
+            "Verified live malware infection exercise published by Brad Duncan. "
+            "Features full network traffic captures (PCAPs), staged payload execution, and IoC extractions."
+        )
+        
+    return platform, threat_type, desc
+
 async def resolve_host_metadata(session, raw_url: str) -> dict:
-    """Passively resolves domain IP and ASN hosting provider without visiting the site."""
     try:
         domain = urllib.parse.urlparse(raw_url).netloc.split(":")[0]
         if not domain:
@@ -135,7 +180,6 @@ async def resolve_host_metadata(session, raw_url: str) -> dict:
         return {"ip": "Unresolved", "org": "Unknown Host", "country": "N/A"}
 
 def detect_target_campaign(url: str) -> str:
-    """Heuristically infers the impersonated brand/campaign theme from a phishing URL."""
     brand_signatures = {
         "Trezor Wallet Phishing": r"trezor",
         "Ledger Wallet Phishing": r"ledger",
@@ -209,9 +253,7 @@ def dispatch_discord_embed(title: str, description: str, fields: list, color: in
 
 # --- COLLECTOR TASKS ---
 
-# 1. Dark Web Ransomware Leak Trackers (Cross-Deduplicated + Dossier Linked)
 async def poll_leak_trackers(session):
-    # Ransomware.live
     try:
         async with session.get("https://api.ransomware.live/v2/recentvictims", timeout=12) as resp:
             if resp.status == 200:
@@ -223,6 +265,8 @@ async def poll_leak_trackers(session):
                         record_event(event_id, "Ransomware.live")
                         note_text = v.get("description") or "No detailed extortion note disclosed."
                         clean_note = clean_html_to_markdown(note_text)[:450]
+                        # Auto-translate extortion note if foreign
+                        translated_note, was_trans = await auto_translate_to_english(clean_note)
                         actor_dossier = get_threat_actor_dossier_links(group)
                         
                         fields = [
@@ -233,9 +277,11 @@ async def poll_leak_trackers(session):
                         permalink = v.get("permalink") or v.get("post_url")
                         if permalink:
                             fields.append({"name": "Full Extortion Dossier", "value": f"[Inspect Leak Page]({permalink})", "inline": False})
+                        
+                        prefix = "🚨 Ransomware Alert [Translated]:" if was_trans else "🚨 Ransomware Alert:"
                         dispatch_discord_embed(
-                            title=f"🚨 Ransomware Alert: {victim}",
-                            description=f"**Extortion Notice / Group Claim:**\n>>> {clean_note}",
+                            title=f"{prefix} {victim}",
+                            description=f"**Extortion Notice / Group Claim:**\n>>> {translated_note}",
                             fields=fields,
                             color=0xE74C3C,
                             image_url=v.get("screenshot"),
@@ -244,7 +290,6 @@ async def poll_leak_trackers(session):
     except Exception as e:
         print(f"[Collector Error] Ransomware.live: {e}")
 
-    # RansomLook
     try:
         async with session.get("https://www.ransomlook.io/api/posts?days=1", timeout=12) as resp:
             if resp.status == 200:
@@ -255,10 +300,13 @@ async def poll_leak_trackers(session):
                     if not is_duplicate(event_id):
                         record_event(event_id, "RansomLook")
                         desc = post.get("description") or "Target listed on double-extortion leak directory."
+                        clean_desc = clean_html_to_markdown(desc)[:350]
+                        translated_desc, was_trans = await auto_translate_to_english(clean_desc)
                         actor_dossier = get_threat_actor_dossier_links(group)
+                        prefix = "🚨 Ransomware Alert [Translated]:" if was_trans else "🚨 Ransomware Alert:"
                         dispatch_discord_embed(
-                            title=f"🚨 Ransomware Alert: {victim}",
-                            description=f"**Extortion Claim:**\n>>> {clean_html_to_markdown(desc)[:350]}",
+                            title=f"{prefix} {victim}",
+                            description=f"**Extortion Claim:**\n>>> {translated_desc}",
                             fields=[
                                 {"name": "Threat Actor Dossier", "value": actor_dossier, "inline": False},
                                 {"name": "Source", "value": "RansomLook API", "inline": True}
@@ -269,7 +317,6 @@ async def poll_leak_trackers(session):
     except Exception as e:
         print(f"[Collector Error] RansomLook: {e}")
 
-    # Ransomwatch Git Stream
     try:
         async with session.get("https://raw.githubusercontent.com/joshhighet/ransomwatch/main/posts.json", timeout=15) as resp:
             if resp.status == 200:
@@ -293,9 +340,7 @@ async def poll_leak_trackers(session):
     except Exception as e:
         print(f"[Collector Error] Ransomwatch: {e}")
 
-# 2. C2, Botnets, Malicious SSL & Infrastructure
 async def poll_infrastructure(session):
-    # Feodo Tracker
     try:
         async with session.get("https://feodotracker.abuse.ch/downloads/ipblocklist_recent.json", timeout=12) as resp:
             if resp.status == 200:
@@ -317,7 +362,6 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] Feodo: {e}")
 
-    # abuse.ch SSLBL
     try:
         async with session.get("https://sslbl.abuse.ch/blacklist/sslipblacklist.csv", timeout=12) as resp:
             if resp.status == 200:
@@ -344,7 +388,6 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] SSLBL: {e}")
 
-    # ThreatMon Daily C2 Feed
     try:
         async with session.get("https://raw.githubusercontent.com/ThreatMon/ThreatMon-Daily-C2-Feeds/main/daily-c2.csv", timeout=12) as resp:
             if resp.status == 200:
@@ -370,7 +413,6 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] ThreatMon: {e}")
 
-    # URLhaus Droppers (With Intelligent Family Extraction)
     try:
         async with session.get("https://urlhaus.abuse.ch/downloads/csv_recent/", timeout=12) as resp:
             if resp.status == 200:
@@ -403,7 +445,6 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] URLhaus: {e}")
 
-    # OpenPhish (With Passive Hosting & Targeted Brand Heuristics)
     try:
         async with session.get("https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt", timeout=12) as resp:
             if resp.status == 200:
@@ -435,7 +476,6 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] OpenPhish: {e}")
 
-# 3. Community IOCs & Campaign Attribution (ThreatFox by abuse.ch)
 async def poll_threatfox(session):
     url = "https://threatfox-api.abuse.ch/api/v1/"
     payload = {"query": "get_iocs", "days": 1}
@@ -478,7 +518,6 @@ async def poll_threatfox(session):
     except Exception as e:
         print(f"[Collector Error] ThreatFox: {e}")
 
-# 4. Live Malware Binaries (MalwareBazaar)
 async def poll_malware_bazaar(session):
     url = "https://mb-api.abuse.ch/api/v1/"
     data = {"query": "get_recent", "selector": "10"}
@@ -510,7 +549,6 @@ async def poll_malware_bazaar(session):
     except Exception as e:
         print(f"[Collector Error] MalwareBazaar: {e}")
 
-# 5. Actively Exploited CVEs (CISA KEV)
 async def poll_vulnerabilities(session):
     try:
         async with session.get("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", timeout=12) as resp:
@@ -535,8 +573,7 @@ async def poll_vulnerabilities(session):
     except Exception as e:
         print(f"[Collector Error] CISA KEV: {e}")
 
-# 6. RSS Feeds (Asynchronous HTTP + Strict 10s Timeout per Feed)
-async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color, needs_translation):
+async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color):
     try:
         headers = {"User-Agent": "HomunculusCTI/2.0 (+https://github.com/homunculus-git)"}
         async with session.get(feed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -555,24 +592,47 @@ async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color,
                 record_event(event_id, publisher)
                 raw_title = entry.title
                 raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
-                clean_text = clean_html_to_markdown(raw_content)[:350]
+                clean_text = clean_html_to_markdown(raw_content)
 
-                if needs_translation:
-                    final_title = f"{alert_type} [Translated]: {translate_to_english(raw_title)}"
-                    final_desc = translate_to_english(clean_text)
+                # Universal Auto-Translation: checks any language, translates only if foreign
+                final_title, title_was_foreign = await auto_translate_to_english(raw_title)
+                final_desc, desc_was_foreign = await auto_translate_to_english(clean_text)
+
+                # Add [Translated] tag if either title or description was translated
+                if title_was_foreign or desc_was_foreign:
+                    display_title = f"{alert_type} [Translated]: {final_title}"
                 else:
-                    final_title = f"{alert_type}: {raw_title}"
-                    final_desc = clean_text
+                    display_title = f"{alert_type}: {raw_title}"
 
-                dispatch_discord_embed(
-                    title=final_title,
-                    description=final_desc + ("..." if len(final_desc) >= 350 else ""),
-                    fields=[
+                if publisher == "Malware Traffic Analysis":
+                    platform, threat_cat, final_desc = classify_research_post(display_title, final_desc)
+                    fields = [
+                        {"name": "Target Platform", "value": f"`{platform}`", "inline": True},
+                        {"name": "Threat Category", "value": f"`{threat_cat}`", "inline": True},
+                        {"name": "Investigation Artifacts", "value": "• `Wireshark PCAP (.zip)`\n• `Infection Binaries`\n• `Host/DNS IoC List`", "inline": False},
+                        {"name": "Forensic Dossier", "value": f"[Open Full Analysis & PCAP Download]({entry.link})", "inline": False}
+                    ]
+                    alert_mitre = "T1204 User Execution • T1071 C2 Traffic • T1056 Input Capture"
+                elif publisher == "vx-underground":
+                    fields = [
+                        {"name": "Source", "value": "`vx-underground Papers Library`", "inline": True},
+                        {"name": "Category", "value": "`Reverse Engineering Whitepaper`", "inline": True},
+                        {"name": "Document Link", "value": f"[Download Paper]({entry.link})", "inline": False}
+                    ]
+                    alert_mitre = "T1588 Obtain Capabilities"
+                else:
+                    fields = [
                         {"name": "Publisher", "value": publisher, "inline": True},
                         {"name": "Details", "value": f"[Open Document / Article]({entry.link})", "inline": False}
-                    ],
+                    ]
+                    alert_mitre = "T1592 Gather Victim Host Info • T1595 Active Scanning" if "Advisory" in alert_type else "T1588 Obtain Capabilities"
+
+                dispatch_discord_embed(
+                    title=display_title,
+                    description=final_desc + ("..." if len(final_desc) >= 350 else ""),
+                    fields=fields,
                     color=color,
-                    mitre_tactics="T1592 Gather Victim Host Info • T1595 Active Scanning" if "Advisory" in alert_type else "T1588 Obtain Capabilities"
+                    mitre_tactics=alert_mitre
                 )
     except asyncio.TimeoutError:
         pass
@@ -580,49 +640,43 @@ async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color,
         print(f"[RSS Error] {publisher}: {e}")
 
 async def poll_rss_streams(session):
+    # Notice: No more manual True/False translation flags! Everything is auto-detected.
     rss_catalog = [
-        # --- Government & CERT Advisories ---
-        ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡 Government Advisory", 0x2980B9, False),
-        ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡 Government Advisory", 0x2980B9, False),
-        ("CISA ICS", "https://www.cisa.gov/rss/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400, False),
-        ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡 Government Advisory", 0x2980B9, True),
-        ("CERT-EU", "https://cert.europa.eu/publications/security-advisories/rss.xml", "🛡 Government Advisory", 0x2980B9, False),
-        ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡 Government Advisory", 0x2980B9, True),
-        ("CERT NZ", "https://www.cert.govt.nz/it-specialists/advisories/rss", "🛡 Government Advisory", 0x2980B9, False),
-        ("ACSC Australia", "https://www.cyber.gov.au/rss/alerts.xml", "🛡 Government Advisory", 0x2980B9, False),
-        ("Canadian Cyber Centre", "https://cyber.gc.ca/api/v1/feed/cyber-advisories/en", "🛡 Government Advisory", 0x2980B9, False),
-
-        # --- Independent Researchers & Reverse Engineering ---
-        ("Malware Traffic Analysis", "https://www.malware-traffic-analysis.net/blog-entries.rss", "🔬 PCAP & Infection Chain", 0x1ABC9C, False),
-        ("vx-underground", "https://vx-underground.org/rss/papers.xml", "🧬 Malware Research & Analysis", 0x8E44AD, False),
-        ("nao_sec", "https://nao-sec.org/feed", "🔬 Independent Threat Hunting", 0x1ABC9C, False),
-        ("BornCity Security", "https://borncity.com/win/feed/", "⚡ Breaking IT & Zero-Day Report", 0x3498DB, True),
-        ("Krebs on Security", "https://krebsonsecurity.com/feed/", "📰 Cybercrime Investigation", 0x2ECC71, False),
-
-        # --- Commercial Threat Labs & Community Research ---
-        ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C, False),
-        ("Malpedia", "https://malpedia.caad.fkie.fraunhofer.de/rss", "🧬 Threat Actor Taxonomy Update", 0x8E44AD, False),
-        ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB, False),
-        ("Exploit-DB", "https://www.exploit-db.com/rss.xml", "💥 Exploit PoC Alert", 0xE91E63, False),
-        ("Packet Storm", "https://packetstorm.news/rss/files", "💥 Exploit PoC Alert", 0xE91E63, False),
-        ("AssureStart CVE", "https://cve.assurestart.co/api/feed.xml?cvss_min=9", "🦠 Vulnerability Alert", 0xE67E22, False),
-        ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71, False),
-        ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71, False),
-
-        # --- Dark Web Leak Stream ---
-        ("ThreatCluster", "https://threatcluster.io/dark-web/feed.xml", "🚨 Dark Web Victim Stream", 0xE74C3C, False)
+        ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡 Government Advisory", 0x2980B9),
+        ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡 Government Advisory", 0x2980B9),
+        ("CISA ICS", "https://www.cisa.gov/rss/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400),
+        ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡 Government Advisory", 0x2980B9),
+        ("CERT-EU", "https://cert.europa.eu/publications/security-advisories/rss.xml", "🛡 Government Advisory", 0x2980B9),
+        ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡 Government Advisory", 0x2980B9),
+        ("CERT NZ", "https://www.cert.govt.nz/it-specialists/advisories/rss", "🛡 Government Advisory", 0x2980B9),
+        ("ACSC Australia", "https://www.cyber.gov.au/rss/alerts.xml", "🛡 Government Advisory", 0x2980B9),
+        ("Canadian Cyber Centre", "https://cyber.gc.ca/api/v1/feed/cyber-advisories/en", "🛡 Government Advisory", 0x2980B9),
+        ("Malware Traffic Analysis", "https://www.malware-traffic-analysis.net/blog-entries.rss", "🔬 PCAP & Infection Chain", 0x1ABC9C),
+        ("vx-underground", "https://vx-underground.org/rss/papers.xml", "🧬 Malware Research & Analysis", 0x8E44AD),
+        ("nao_sec", "https://nao-sec.org/feed", "🔬 Independent Threat Hunting", 0x1ABC9C),
+        ("BornCity Security", "https://borncity.com/win/feed/", "⚡ Breaking IT & Zero-Day Report", 0x3498DB),
+        ("Krebs on Security", "https://krebsonsecurity.com/feed/", "📰 Cybercrime Investigation", 0x2ECC71),
+        ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C),
+        ("Malpedia", "https://malpedia.caad.fkie.fraunhofer.de/rss", "🧬 Threat Actor Taxonomy Update", 0x8E44AD),
+        ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB),
+        ("Exploit-DB", "https://www.exploit-db.com/rss.xml", "💥 Exploit PoC Alert", 0xE91E63),
+        ("Packet Storm", "https://packetstorm.news/rss/files", "💥 Exploit PoC Alert", 0xE91E63),
+        ("AssureStart CVE", "https://cve.assurestart.co/api/feed.xml?cvss_min=9", "🦠 Vulnerability Alert", 0xE67E22),
+        ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71),
+        ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71),
+        ("ThreatCluster", "https://threatcluster.io/dark-web/feed.xml", "🚨 Dark Web Victim Stream", 0xE74C3C)
     ]
     
     rss_tasks = [
-        fetch_and_process_rss(session, pub, url, a_type, color, translate)
-        for pub, url, a_type, color, translate in rss_catalog
+        fetch_and_process_rss(session, pub, url, a_type, color)
+        for pub, url, a_type, color in rss_catalog
     ]
     await asyncio.gather(*rss_tasks, return_exceptions=True)
 
 # --- ORCHESTRATION ---
 
 async def main():
-    print("[*] Homunculus 32-Source Threat Intelligence Stream Running.")
+    print("[*] Homunculus 32-Source Threat Intelligence Stream Running (Universal Auto-Translation Active).")
     while True:
         async with aiohttp.ClientSession() as session:
             await asyncio.gather(
