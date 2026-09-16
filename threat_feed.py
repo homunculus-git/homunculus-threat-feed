@@ -13,7 +13,6 @@ import requests
 import feedparser
 import urllib.parse
 from dotenv import load_dotenv
-from deep_translator import MyMemoryTranslator
 
 load_dotenv()
 
@@ -65,7 +64,7 @@ TRANSLATION_LOCK = asyncio.Lock()
 TRANSLATION_CACHE = {}
 
 def _sync_translate(text: str) -> tuple[str, bool]:
-    """Translates text to English using direct Google GTX endpoint with MyMemory fallback."""
+    """Translates text to English using Google GTX endpoint with language detection."""
     if not text or not text.strip():
         return "", False
 
@@ -75,48 +74,36 @@ def _sync_translate(text: str) -> tuple[str, bool]:
     if sample in TRANSLATION_CACHE:
         return TRANSLATION_CACHE[sample]
 
-    low = sample.lower()
-    if all(ord(c) < 128 for c in sample) and any(w in low for w in ["vulnerability", "security", "advisory", "the ", "attack", "critical", "update"]):
-        TRANSLATION_CACHE[sample] = (text, False)
-        return text, False
-
-    translated = None
-
-    # Tier 1: Direct Google GTX Gateway
     try:
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q={urllib.parse.quote(sample[:3000])}"
-        resp = requests.get(url, timeout=6)
+        resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
+            # data[2] contains the detected source language (e.g. 'de', 'fr', 'en')
+            detected_lang = data[2] if len(data) > 2 and isinstance(data[2], str) else "auto"
+            
+            # If Google detected English, do not alter or mark as translated
+            if detected_lang.lower().startswith("en"):
+                TRANSLATION_CACHE[sample] = (text, False)
+                return text, False
+
             if data and data[0]:
                 res = "".join([segment[0] for segment in data[0] if segment and segment[0]])
                 if res and res.strip().lower() != sample.strip().lower():
-                    translated = res
-    except Exception:
-        pass
-
-    # Tier 2: MyMemoryTranslator fallback (en-GB)
-    if not translated:
-        try:
-            mm = MyMemoryTranslator(source='auto', target='en-GB')
-            res = mm.translate(sample[:800])
-            if res and res.strip().lower() != sample.strip().lower():
-                translated = res
-        except Exception:
-            pass
-
-    if translated:
-        prefix_match = re.match(r'^(\[.*?\]\s*)+', text)
-        prefix = prefix_match.group(0) if prefix_match else ""
-        final_res = f"{prefix}{translated}".strip()
-        TRANSLATION_CACHE[sample] = (final_res, True)
-        return final_res, True
+                    # Preserve bracketed metadata tag prefix if one was present
+                    prefix_match = re.match(r'^(\[.*?\]\s*)+', text)
+                    prefix = prefix_match.group(0) if prefix_match else ""
+                    final_res = f"{prefix}{res}".strip()
+                    TRANSLATION_CACHE[sample] = (final_res, True)
+                    return final_res, True
+    except Exception as e:
+        print(f"[Translation Engine Warning] {e}")
 
     TRANSLATION_CACHE[sample] = (text, False)
     return text, False
 
 async def auto_translate_to_english(text: str) -> tuple[str, bool]:
-    """Asynchronously translates foreign content without blocking."""
+    """Asynchronously translates foreign content with debounce to prevent rate-limiting."""
     if not text:
         return "", False
     async with TRANSLATION_LOCK:
@@ -671,7 +658,7 @@ async def poll_vulnerabilities(session):
     except Exception as e:
         print(f"[Collector Error] CISA KEV: {e}")
 
-async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color):
+async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color, may_need_translation=False):
     try:
         headers = {"User-Agent": "HomunculusCTI/2.0 (+https://github.com/homunculus-git)"}
         async with session.get(feed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -692,12 +679,16 @@ async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color)
                 raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
                 clean_text = clean_html_to_markdown(raw_content)
 
-                final_title, title_was_foreign = await auto_translate_to_english(raw_title)
-                final_desc, desc_was_foreign = await auto_translate_to_english(clean_text)
-
-                if title_was_foreign or desc_was_foreign:
-                    display_title = f"{alert_type} [Translated]: {final_title}"
+                # Only translate feeds marked as potentially foreign (CERT-Bund, CERT-FR, etc.)
+                if may_need_translation:
+                    final_title, title_was_foreign = await auto_translate_to_english(raw_title)
+                    final_desc, desc_was_foreign = await auto_translate_to_english(clean_text)
+                    if title_was_foreign or desc_was_foreign:
+                        display_title = f"{alert_type} [Translated]: {final_title}"
+                    else:
+                        display_title = f"{alert_type}: {raw_title}"
                 else:
+                    final_desc = clean_text
                     display_title = f"{alert_type}: {raw_title}"
 
                 if publisher == "Malware Traffic Analysis":
@@ -736,42 +727,44 @@ async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color)
         print(f"[RSS Error] {publisher}: {e}")
 
 async def poll_rss_streams(session):
+    # (Publisher, Feed URL, Alert Type, Color, May Need Translation)
+    # Feeds that are exclusively English (CISA, NCSC, THN, etc.) have False to save rate limits.
     rss_catalog = [
-        ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡 Government Advisory", 0x2980B9),
-        ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡 Government Advisory", 0x2980B9),
-        ("CISA ICS", "https://www.cisa.gov/rss/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400),
-        ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡 Government Advisory", 0x2980B9),
-        ("CERT-EU", "https://cert.europa.eu/publications/security-advisories/rss.xml", "🛡 Government Advisory", 0x2980B9),
-        ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡 Government Advisory", 0x2980B9),
-        ("CERT NZ", "https://www.cert.govt.nz/it-specialists/advisories/rss", "🛡 Government Advisory", 0x2980B9),
-        ("ACSC Australia", "https://www.cyber.gov.au/rss/alerts.xml", "🛡 Government Advisory", 0x2980B9),
-        ("Canadian Cyber Centre", "https://cyber.gc.ca/api/v1/feed/cyber-advisories/en", "🛡 Government Advisory", 0x2980B9),
-        ("Malware Traffic Analysis", "https://www.malware-traffic-analysis.net/blog-entries.rss", "🔬 PCAP & Infection Chain", 0x1ABC9C),
-        ("vx-underground", "https://vx-underground.org/rss/papers.xml", "🧬 Malware Research & Analysis", 0x8E44AD),
-        ("nao_sec", "https://nao-sec.org/feed", "🔬 Independent Threat Hunting", 0x1ABC9C),
-        ("BornCity Security", "https://borncity.com/win/feed/", "⚡ Breaking IT & Zero-Day Report", 0x3498DB),
-        ("Krebs on Security", "https://krebsonsecurity.com/feed/", "📰 Cybercrime Investigation", 0x2ECC71),
-        ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C),
-        ("Malpedia", "https://malpedia.caad.fkie.fraunhofer.de/rss", "🧬 Threat Actor Taxonomy Update", 0x8E44AD),
-        ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB),
-        ("Exploit-DB", "https://www.exploit-db.com/rss.xml", "💥 Exploit PoC Alert", 0xE91E63),
-        ("Packet Storm", "https://packetstorm.news/rss/files", "💥 Exploit PoC Alert", 0xE91E63),
-        ("AssureStart CVE", "https://cve.assurestart.co/api/feed.xml?cvss_min=9", "🦠 Vulnerability Alert", 0xE67E22),
-        ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71),
-        ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71),
-        ("ThreatCluster", "https://threatcluster.io/dark-web/feed.xml", "🚨 Dark Web Victim Stream", 0xE74C3C)
+        ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡 Government Advisory", 0x2980B9, False),
+        ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡 Government Advisory", 0x2980B9, False),
+        ("CISA ICS", "https://www.cisa.gov/rss/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400, False),
+        ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡 Government Advisory", 0x2980B9, True),
+        ("CERT-EU", "https://cert.europa.eu/publications/security-advisories/rss.xml", "🛡 Government Advisory", 0x2980B9, True),
+        ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡 Government Advisory", 0x2980B9, True),
+        ("CERT NZ", "https://www.cert.govt.nz/it-specialists/advisories/rss", "🛡 Government Advisory", 0x2980B9, False),
+        ("ACSC Australia", "https://www.cyber.gov.au/rss/alerts.xml", "🛡 Government Advisory", 0x2980B9, False),
+        ("Canadian Cyber Centre", "https://cyber.gc.ca/api/v1/feed/cyber-advisories/en", "🛡 Government Advisory", 0x2980B9, False),
+        ("Malware Traffic Analysis", "https://www.malware-traffic-analysis.net/blog-entries.rss", "🔬 PCAP & Infection Chain", 0x1ABC9C, False),
+        ("vx-underground", "https://vx-underground.org/rss/papers.xml", "🧬 Malware Research & Analysis", 0x8E44AD, False),
+        ("nao_sec", "https://nao-sec.org/feed", "🔬 Independent Threat Hunting", 0x1ABC9C, True),
+        ("BornCity Security", "https://borncity.com/win/feed/", "⚡ Breaking IT & Zero-Day Report", 0x3498DB, True),
+        ("Krebs on Security", "https://krebsonsecurity.com/feed/", "📰 Cybercrime Investigation", 0x2ECC71, False),
+        ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C, False),
+        ("Malpedia", "https://malpedia.caad.fkie.fraunhofer.de/rss", "🧬 Threat Actor Taxonomy Update", 0x8E44AD, False),
+        ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB, False),
+        ("Exploit-DB", "https://www.exploit-db.com/rss.xml", "💥 Exploit PoC Alert", 0xE91E63, False),
+        ("Packet Storm", "https://packetstorm.news/rss/files", "💥 Exploit PoC Alert", 0xE91E63, False),
+        ("AssureStart CVE", "https://cve.assurestart.co/api/feed.xml?cvss_min=9", "🦠 Vulnerability Alert", 0xE67E22, False),
+        ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71, False),
+        ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71, False),
+        ("ThreatCluster", "https://threatcluster.io/dark-web/feed.xml", "🚨 Dark Web Victim Stream", 0xE74C3C, True)
     ]
     
     rss_tasks = [
-        fetch_and_process_rss(session, pub, url, a_type, color)
-        for pub, url, a_type, color in rss_catalog
+        fetch_and_process_rss(session, pub, url, a_type, color, trans_flag)
+        for pub, url, a_type, color, trans_flag in rss_catalog
     ]
     await asyncio.gather(*rss_tasks, return_exceptions=True)
 
 # --- ORCHESTRATION ---
 
 async def main():
-    print("[*] Homunculus 32-Source Threat Intelligence Stream Running (Universal Auto-Translation & Subnet Intelligence Active).")
+    print("[*] Homunculus 32-Source Threat Intelligence Stream Running (Selective Auto-Translation & Subnet Intelligence Active).")
     while True:
         async with aiohttp.ClientSession() as session:
             await asyncio.gather(
