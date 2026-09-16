@@ -3,6 +3,7 @@ import re
 import csv
 import io
 import html
+import time
 import base64
 import socket
 import sqlite3
@@ -60,31 +61,72 @@ def normalize_leak_event_id(group: str, victim: str) -> str:
     return f"victim_{clean_group}_{clean_victim}"
 
 # --- UNIVERSAL AUTO-TRANSLATOR ENGINE ---
-def _sync_translate_if_foreign(text: str) -> tuple[str, bool]:
-    """Translates text to English if foreign. Returns (translated_text, was_translated)."""
+from deep_translator import MyMemoryTranslator
+
+TRANSLATION_LOCK = asyncio.Lock()
+TRANSLATION_CACHE = {}
+
+def _sync_translate(text: str) -> tuple[str, bool]:
+    """Translates text to English using direct Google GTX endpoint with MyMemory fallback."""
     if not text or not text.strip():
         return "", False
-    
-    # Strip bracketed metadata tags like [NEU] [mittel] that confuse translation models
+
     cleaned = re.sub(r'\[.*?\]', '', text).strip()
     sample = cleaned if len(cleaned) > 5 else text
 
-    try:
-        t = GoogleTranslator(source='auto', target='en')
-        translated = t.translate(sample)
-        # If the translation differs meaningfully from the original, it was foreign
-        if translated and translated.strip().lower() != sample.strip().lower():
-            return translated, True
-        return text, False
-    except Exception:
+    if sample in TRANSLATION_CACHE:
+        return TRANSLATION_CACHE[sample]
+
+    # Skip obvious English technical text
+    low = sample.lower()
+    if all(ord(c) < 128 for c in sample) and any(w in low for w in ["vulnerability", "security", "advisory", "the ", "attack", "critical", "update"]):
+        TRANSLATION_CACHE[sample] = (text, False)
         return text, False
 
+    translated = None
+
+    # Tier 1: Direct Google GTX Gateway (Zero tokens, Chrome client, bypasses deep-translator IP limits)
+    try:
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q={urllib.parse.quote(sample[:3000])}"
+        resp = requests.get(url, timeout=6)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and data[0]:
+                res = "".join([segment[0] for segment in data[0] if segment and segment[0]])
+                if res and res.strip().lower() != sample.strip().lower():
+                    translated = res
+    except Exception:
+        pass
+
+    # Tier 2: MyMemoryTranslator fallback (using valid en-GB locale)
+    if not translated:
+        try:
+            mm = MyMemoryTranslator(source='auto', target='en-GB')
+            res = mm.translate(sample[:800])
+            if res and res.strip().lower() != sample.strip().lower():
+                translated = res
+        except Exception as e:
+            print(f"[Translation Engine] Fallbacks exhausted: {e}")
+
+    if translated:
+        prefix_match = re.match(r'^(\[.*?\]\s*)+', text)
+        prefix = prefix_match.group(0) if prefix_match else ""
+        final_res = f"{prefix}{translated}".strip()
+        TRANSLATION_CACHE[sample] = (final_res, True)
+        return final_res, True
+
+    TRANSLATION_CACHE[sample] = (text, False)
+    return text, False
+
 async def auto_translate_to_english(text: str) -> tuple[str, bool]:
-    """Asynchronously translates foreign content without blocking the event loop."""
+    """Asynchronously translates foreign content without blocking."""
     if not text:
         return "", False
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _sync_translate_if_foreign, text)
+    async with TRANSLATION_LOCK:
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(None, _sync_translate, text)
+        await asyncio.sleep(0.2)
+        return res
 
 # --- MITRE ATT&CK & THREAT ACTOR ENRICHMENT ENGINES ---
 
@@ -265,7 +307,6 @@ async def poll_leak_trackers(session):
                         record_event(event_id, "Ransomware.live")
                         note_text = v.get("description") or "No detailed extortion note disclosed."
                         clean_note = clean_html_to_markdown(note_text)[:450]
-                        # Auto-translate extortion note if foreign
                         translated_note, was_trans = await auto_translate_to_english(clean_note)
                         actor_dossier = get_threat_actor_dossier_links(group)
                         
@@ -594,11 +635,10 @@ async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color)
                 raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
                 clean_text = clean_html_to_markdown(raw_content)
 
-                # Universal Auto-Translation: checks any language, translates only if foreign
+                # Universal Auto-Translation: translate foreign text into English
                 final_title, title_was_foreign = await auto_translate_to_english(raw_title)
                 final_desc, desc_was_foreign = await auto_translate_to_english(clean_text)
 
-                # Add [Translated] tag if either title or description was translated
                 if title_was_foreign or desc_was_foreign:
                     display_title = f"{alert_type} [Translated]: {final_title}"
                 else:
@@ -629,7 +669,7 @@ async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color)
 
                 dispatch_discord_embed(
                     title=display_title,
-                    description=final_desc + ("..." if len(final_desc) >= 350 else ""),
+                    description=final_desc[:1900] + ("..." if len(final_desc) >= 1900 else ""),
                     fields=fields,
                     color=color,
                     mitre_tactics=alert_mitre
@@ -640,7 +680,6 @@ async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color)
         print(f"[RSS Error] {publisher}: {e}")
 
 async def poll_rss_streams(session):
-    # Notice: No more manual True/False translation flags! Everything is auto-detected.
     rss_catalog = [
         ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡 Government Advisory", 0x2980B9),
         ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡 Government Advisory", 0x2980B9),
