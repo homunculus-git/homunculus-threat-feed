@@ -13,7 +13,7 @@ import requests
 import feedparser
 import urllib.parse
 from dotenv import load_dotenv
-from deep_translator import GoogleTranslator
+from deep_translator import MyMemoryTranslator
 
 load_dotenv()
 
@@ -61,8 +61,6 @@ def normalize_leak_event_id(group: str, victim: str) -> str:
     return f"victim_{clean_group}_{clean_victim}"
 
 # --- UNIVERSAL AUTO-TRANSLATOR ENGINE ---
-from deep_translator import MyMemoryTranslator
-
 TRANSLATION_LOCK = asyncio.Lock()
 TRANSLATION_CACHE = {}
 
@@ -77,7 +75,6 @@ def _sync_translate(text: str) -> tuple[str, bool]:
     if sample in TRANSLATION_CACHE:
         return TRANSLATION_CACHE[sample]
 
-    # Skip obvious English technical text
     low = sample.lower()
     if all(ord(c) < 128 for c in sample) and any(w in low for w in ["vulnerability", "security", "advisory", "the ", "attack", "critical", "update"]):
         TRANSLATION_CACHE[sample] = (text, False)
@@ -85,7 +82,7 @@ def _sync_translate(text: str) -> tuple[str, bool]:
 
     translated = None
 
-    # Tier 1: Direct Google GTX Gateway (Zero tokens, Chrome client, bypasses deep-translator IP limits)
+    # Tier 1: Direct Google GTX Gateway
     try:
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q={urllib.parse.quote(sample[:3000])}"
         resp = requests.get(url, timeout=6)
@@ -98,15 +95,15 @@ def _sync_translate(text: str) -> tuple[str, bool]:
     except Exception:
         pass
 
-    # Tier 2: MyMemoryTranslator fallback (using valid en-GB locale)
+    # Tier 2: MyMemoryTranslator fallback (en-GB)
     if not translated:
         try:
             mm = MyMemoryTranslator(source='auto', target='en-GB')
             res = mm.translate(sample[:800])
             if res and res.strip().lower() != sample.strip().lower():
                 translated = res
-        except Exception as e:
-            print(f"[Translation Engine] Fallbacks exhausted: {e}")
+        except Exception:
+            pass
 
     if translated:
         prefix_match = re.match(r'^(\[.*?\]\s*)+', text)
@@ -220,6 +217,49 @@ async def resolve_host_metadata(session, raw_url: str) -> dict:
         return {"ip": ip, "org": "Unknown Host", "country": "N/A"}
     except Exception:
         return {"ip": "Unresolved", "org": "Unknown Host", "country": "N/A"}
+
+async def enrich_dropper_infrastructure(session, raw_url: str) -> dict:
+    """Enriches dropper IP with routing details and queries ThreatFox for /24 neighbor hits."""
+    info = {
+        "ip": None,
+        "routing": "Unknown ASN",
+        "subnet_note": "Clean / Unflagged",
+        "strains": []
+    }
+    try:
+        host = urllib.parse.urlparse(raw_url).netloc.split(":")[0]
+        if not host:
+            return info
+            
+        loop = asyncio.get_running_loop()
+        addr_info = await loop.run_in_executor(None, socket.getaddrinfo, host, None)
+        ip = addr_info[0][4][0]
+        info["ip"] = ip
+        
+        async with session.get(f"http://ip-api.com/json/{ip}?fields=status,country,as,org", timeout=4) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("status") == "success":
+                    as_num = data.get("as", "").split(" ")[0]
+                    org = data.get("org") or data.get("as", "")
+                    country = data.get("country", "")
+                    info["routing"] = f"`{as_num}` {org} ({country})"
+                    
+        octets = ip.split(".")
+        if len(octets) == 4:
+            subnet = f"{octets[0]}.{octets[1]}.{octets[2]}."
+            async with session.post("https://threatfox-api.abuse.ch/api/v1/", json={"query": "search_ioc", "search_term": subnet}, timeout=5) as tf:
+                if tf.status == 200:
+                    tdata = await tf.json()
+                    if tdata.get("query_status") == "ok":
+                        items = tdata.get("data", [])
+                        strains = {it.get("malware_printable") for it in items if it.get("malware_printable")}
+                        info["strains"] = sorted(list(strains))[:4]
+                        if len(items) > 0:
+                            info["subnet_note"] = f"⚠️ **Flagged C2 Subnet**: `{len(items)}` neighbor hit(s) in `/24`"
+    except Exception:
+        pass
+    return info
 
 def detect_target_campaign(url: str) -> str:
     brand_signatures = {
@@ -470,16 +510,33 @@ async def poll_infrastructure(session):
                             urlscan_search = f"https://urlscan.io/search/#page.url:%22{urllib.parse.quote(raw_url, safe='')}%22"
                             urlhaus_dossier = f"https://urlhaus.abuse.ch/url/{url_id}/"
                             
+                            # Infrastructure Routing & /24 Subnet Threat Intelligence
+                            infra = await enrich_dropper_infrastructure(session, raw_url)
+                            
+                            fields = [
+                                {"name": "Malware / Botnet Family", "value": f"**{detected_family}**", "inline": True},
+                                {"name": "Threat Database", "value": f"[View URLhaus Dossier]({urlhaus_dossier})", "inline": True},
+                                {"name": "Routing & ASN", "value": infra["routing"], "inline": False}
+                            ]
+                            
+                            if "Flagged" in infra["subnet_note"]:
+                                strains_str = ", ".join(infra["strains"]) if infra["strains"] else "Unclassified Botnet"
+                                fields.append({
+                                    "name": "Subnet Threat History (/24)",
+                                    "value": f"{infra['subnet_note']}\nAssociated Strains: `{strains_str}`",
+                                    "inline": False
+                                })
+                                
+                            fields.extend([
+                                {"name": "Campaign Tags", "value": f"`{tags or 'None'}`", "inline": False},
+                                {"name": "Defanged Payload Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
+                                {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Search on URLScan.io]({urlscan_search})", "inline": False}
+                            ])
+                            
                             dispatch_discord_embed(
                                 title=f"☣ Malware Dropper: {detected_family}",
                                 description="Payload distribution URL detected in live malware campaigns.",
-                                fields=[
-                                    {"name": "Malware / Botnet Family", "value": f"**{detected_family}**", "inline": True},
-                                    {"name": "Threat Database", "value": f"[View URLhaus Dossier]({urlhaus_dossier})", "inline": True},
-                                    {"name": "Campaign Tags", "value": f"`{tags or 'None'}`", "inline": False},
-                                    {"name": "Defanged Payload Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
-                                    {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Search on URLScan.io]({urlscan_search})", "inline": False}
-                                ],
+                                fields=fields,
                                 color=0xE67E22,
                                 mitre_tactics="T1204.001 Malicious Link • T1105 Ingress Tool Transfer"
                             )
@@ -635,7 +692,6 @@ async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color)
                 raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
                 clean_text = clean_html_to_markdown(raw_content)
 
-                # Universal Auto-Translation: translate foreign text into English
                 final_title, title_was_foreign = await auto_translate_to_english(raw_title)
                 final_desc, desc_was_foreign = await auto_translate_to_english(clean_text)
 
@@ -715,7 +771,7 @@ async def poll_rss_streams(session):
 # --- ORCHESTRATION ---
 
 async def main():
-    print("[*] Homunculus 32-Source Threat Intelligence Stream Running (Universal Auto-Translation Active).")
+    print("[*] Homunculus 32-Source Threat Intelligence Stream Running (Universal Auto-Translation & Subnet Intelligence Active).")
     while True:
         async with aiohttp.ClientSession() as session:
             await asyncio.gather(
