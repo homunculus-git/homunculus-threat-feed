@@ -1,15 +1,18 @@
 # Homunculus Threat Feed
 
-Real-time cyber threat intelligence aggregator streaming 30+ feeds to Discord, WhatsApp, or Telegram.
+**Homunculus** is a real-time cyber threat intelligence aggregator that streams 30+ curated feeds into Discord (with WhatsApp and Telegram support). Built for SOC analysts, threat hunters, and security teams who need immediate visibility into emerging threats without noise or duplication.
 
 ## Features
 
-- **32 Threat Intelligence Sources**: Ransomware leaks, malware droppers, phishing URLs, C2 infrastructure, CVEs, and government advisories
-- **Auto-Translation**: German, French, and other foreign-language advisories translated to English
-- **Infrastructure Enrichment**: ASN, hosting provider, country, and subnet threat history
-- **Deduplication**: SQLite-backed event cache prevents duplicate alerts
-- **MITRE ATT&CK Mapping**: Threat actor dossiers linked to MITRE Group IDs
-- **Multi-Platform Alerts**: Discord (native), WhatsApp, or Telegram
+- **32 Threat Intelligence Sources**: Ransomware leaks, malware droppers, phishing URLs, C2 infrastructure, CVEs, and government advisories from trusted publishers including CISA, NCSC UK, CERT-Bund, CERT-FR, abuse.ch, and independent researchers
+- **Auto-Translation Engine**: German, French, and other foreign-language advisories automatically translated to English using Google Translate API with language detection and rate-limit protection
+- **Infrastructure Enrichment**: Every phishing URL and malware dropper is resolved to IP, ASN, hosting provider, and country; subnet-level threat history queried from ThreatFox to identify flagged C2 neighborhoods
+- **SQLite Deduplication**: Persistent event cache prevents duplicate alerts across restarts; each event ID is tracked with source and timestamp
+- **MITRE ATT&CK Mapping**: Known ransomware groups mapped to MITRE Group IDs (e.g., LockBit → G0092); dynamic links to MITRE and Malpedia dossiers
+- **Multi-Platform Alerts**: Discord webhooks (rich embeds), WhatsApp (Twilio), or Telegram bot API
+- **Defanged URLs**: All malicious links automatically defanged (`hxxp://`, `[.]`) to prevent accidental clicks
+- **Sandbox Integration**: One-click links to VirusTotal, URLScan.io, Triage, and Ghidra Lab for deeper investigation
+- **RSS Stream Processor**: 20+ government and research RSS feeds polled asynchronously with per-feed timeouts and error isolation
 
 ---
 
@@ -199,4 +202,6 @@ rm threat_cache.db
 
 ## License
 
-MIT
+**Open Source (MIT License)**
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
