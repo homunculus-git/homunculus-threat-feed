@@ -1,5 +1,11 @@
-.venv/
-__pycache__/
-*.pyc
+*.bin
 .env
+*.gpr
+*.lock
+*.lock~
+*.pyc
+__pycache__/
+*.rep/
+samples/
 threat_cache.db
+.venv/

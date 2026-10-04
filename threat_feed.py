@@ -248,27 +248,107 @@ async def enrich_dropper_infrastructure(session, raw_url: str) -> dict:
         pass
     return info
 
+async def resolve_urlscan_link(session, target_url: str) -> str:
+    """Query URLScan API for the latest scan breakdown or fallback to pre-filled scanner."""
+    try:
+        domain = urllib.parse.urlparse(target_url).netloc
+        api_query = f"https://urlscan.io/api/v1/search/?q=domain:{domain}&size=1"
+        async with session.get(api_query, timeout=3) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                results = data.get("results", [])
+                if results and "_id" in results[0]:
+                    uuid = results[0]["_id"]
+                    return f"https://urlscan.io/result/{uuid}/"
+    except Exception:
+        pass
+    # Fallback directly to scanner homepage with target URL prefilled
+    return f"https://urlscan.io/search/#domain:{urllib.parse.urlparse(target_url).netloc}"
+
+async def resolve_page_title(session, url: str) -> str:
+    """Safely fetch the HTML <title> without downloading full binaries/assets."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        async with session.get(url, timeout=3, headers=headers, ssl=False, allow_redirects=True) as resp:
+            if resp.status == 200:
+                chunk = await resp.content.read(4096)
+                html_text = chunk.decode("utf-8", errors="ignore")
+                match = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL)
+                if match:
+                    title = match.group(1).strip()
+                    # Clean out excess newlines or spaces
+                    title = " ".join(title.split())
+                    if title and len(title) > 2 and len(title) < 90:
+                        return title
+    except Exception:
+        pass
+    return ""
+
 def detect_target_campaign(url: str) -> str:
     brand_signatures = {
-        "Trezor Wallet Phishing": r"trezor",
-        "Ledger Wallet Phishing": r"ledger",
-        "MetaMask Phishing": r"metamask",
-        "Coinbase Phishing": r"coinbase",
-        "Binance Phishing": r"binance",
-        "Phantom Wallet Phishing": r"phantom",
-        "PayPal Credential Harvest": r"paypal",
-        "Microsoft 365 / Outlook Harvest": r"office365|microsoft|outlook|sharepoint|onedrive",
-        "Google Account Harvest": r"google|gmail|accounts-google",
-        "Apple ID Harvest": r"appleid|icloud",
-        "Netflix Billing Scam": r"netflix",
-        "DHL / Parcel Delivery Scam": r"dhl|parcel|delivery-track",
-        "Banking Portal Impersonation": r"chase|hsbc|barclays|natwest|lloyds|santander",
+        # Corporate & Identity Portals
+        "Microsoft 365 / Entra ID Harvest": r"office365|microsoft|outlook|sharepoint|onedrive|o365|msft|login\.live|owa|adfs|bpos|mdm|intune",
+        "Google Workspace / Accounts": r"google|gmail|accounts-google|gsuite|gdrive|docs-google|drive-google",
+        "Apple ID / iCloud Phishing": r"appleid|icloud|apple-id|findmy",
+        "Adobe / Document Cloud": r"adobe|acrobat|adobesign",
+        "DocuSign Lure Phish": r"docusign|esign|docusg",
+        
+        # Crypto & Web3 Wallets
+        "Trezor Hardware Wallet Phish": r"trezor",
+        "Ledger Hardware Wallet Phish": r"ledger",
+        "MetaMask Web3 Phish": r"metamask",
+        "Coinbase Exchange Phish": r"coinbase",
+        "Binance Exchange Phish": r"binance|bnance",
+        "Phantom Solana Wallet Phish": r"phantom|solflare",
+        
+        # Banking & Financial
+        "PayPal Credential Harvest": r"paypal|pypl",
+        "JPMorgan Chase Impersonation": r"chase|jpmorgan",
+        "Bank of America Impersonation": r"bankofamerica|bofa",
+        "Wells Fargo Impersonation": r"wellsfargo",
+        "UK / EU Banking Impersonation": r"hsbc|barclays|natwest|lloyds|santander|halifax|revolut",
+        "Stripe / Merchant Harvest": r"stripe|merchant-portal",
+        
+        # Delivery & Logistics Scams
+        "Postal / Parcel Delivery Scam": r"dhl|parcel|delivery-track|usps|fedex|ups-tracking|post-office|evri",
+        
+        # Telecom & Social / Streaming
+        "Netflix / Streaming Scam": r"netflix|spotify",
+        "Meta / Facebook / WhatsApp": r"facebook|fb-login|instagram|meta-security|whatsapp",
+        "Telecom / Carrier Phishing": r"att-login|verizon|t-mobile|vodafone",
+        
+        # Cloud Platform Abuse (Pages / Workers / Vercel / Netlify / Firebase)
+        "Cloudflare Pages Staged Phish": r"pages\.dev",
+        "Vercel / Netlify Staged Phish": r"vercel\.app|netlify\.app",
+        "Firebase Staged Phish": r"web\.app|firebaseapp\.com",
     }
     low = url.lower()
     for label, pattern in brand_signatures.items():
         if re.search(pattern, low):
             return label
     return "Unattributed / Generic Credential Phish"
+
+async def check_payload_liveness(session, url: str) -> str:
+    """Quickly probe whether the malware dropper host is live or offline."""
+    try:
+        real_url = url.replace("hxxp", "http").replace("[.]", ".")
+        headers = {"User-Agent": "Wget/1.21"}
+        async with session.head(real_url, timeout=2.5, headers=headers, ssl=False, allow_redirects=True) as resp:
+            if resp.status == 200:
+                length = resp.headers.get("Content-Length")
+                if length and length.isdigit():
+                    kb = int(length) // 1024
+                    return f"🟢 Live ({kb} KB)"
+                return "🟢 Live (Online)"
+            elif resp.status == 404:
+                return "🔴 Offline (404 Removed)"
+            else:
+                return f"🟡 Responding (HTTP {resp.status})"
+    except Exception:
+        return "🔴 Dead / Offline"
 
 def extract_malware_family(raw_tags: str) -> str:
     if not raw_tags or raw_tags.strip() == "None":
@@ -494,7 +574,7 @@ async def poll_infrastructure(session):
                             record_event(event_id, "URLhaus")
                             detected_family = extract_malware_family(tags)
                             vt_url = get_virustotal_url_link(raw_url)
-                            urlscan_search = f"https://urlscan.io/search/#page.url:%22{urllib.parse.quote(raw_url, safe='')}%22"
+                            urlscan_link = f"https://urlscan.io/#{link}"
                             urlhaus_dossier = f"https://urlhaus.abuse.ch/url/{url_id}/"
                             
                             # Infrastructure Routing & /24 Subnet Threat Intelligence
@@ -514,10 +594,12 @@ async def poll_infrastructure(session):
                                     "inline": False
                                 })
                                 
+                            liveness = await check_payload_liveness(session, raw_url)
                             fields.extend([
-                                {"name": "Campaign Tags", "value": f"`{tags or 'None'}`", "inline": False},
+                                {"name": "Host Status", "value": f"**{liveness}**", "inline": True},
+                                {"name": "Campaign Tags", "value": f"`{tags or 'None'}`", "inline": True},
                                 {"name": "Defanged Payload Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
-                                    {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Search on URLScan.io]({urlscan_search})", "inline": False}
+                                    {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Scan on URLScan.io]({urlscan_link}) • [Detonate on Triage](https://triage.geekman.com/?search={raw_url}) • [⚡ Open in Ghidra Lab](http://127.0.0.1:9999/triage?target={urllib.parse.quote(raw_url)})", "inline": False}
                             ])
                             
                             dispatch_discord_embed(
@@ -533,27 +615,52 @@ async def poll_infrastructure(session):
     try:
         async with session.get("https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt", timeout=12) as resp:
             if resp.status == 200:
-                for raw_link in (await resp.text()).splitlines()[:3]:
+                for raw_link in (await resp.text()).splitlines()[:5]:
                     link = raw_link.strip()
                     if link:
-                        event_id = f"phish_{hash(link)}"
+                        domain = urllib.parse.urlparse(link).netloc.lower()
+                        # Deduplicate by domain so different paths on same host do not trigger repeat alerts
+                        event_id = f"phish_{domain}" if domain else f"phish_{hash(link)}"
                         if not is_duplicate(event_id):
                             record_event(event_id, "OpenPhish")
                             vt_url = get_virustotal_url_link(link)
-                            urlscan_search = f"https://urlscan.io/search/#page.url:%22{urllib.parse.quote(link, safe='')}%22"
+                            urlscan_link = f"https://urlscan.io/#{link}"
                             campaign = detect_target_campaign(link)
+                            
                             net_meta = await resolve_host_metadata(session, link)
                             
+                            # Clean host classification & DNS Status
+                            is_resolved = net_meta.get("ip") != "Unresolved"
+                            dns_badge = "🟢 Live DNS" if is_resolved else "⚠️ Host currently unresolved"
+                            host_type = "Cloud Stager" if any(h in link for h in ["pages.dev", "vercel.app", "netlify.app", "firebaseapp.com"]) else "Self-Hosted / VPS"
+
                             dispatch_discord_embed(
                                 title=f"🎣 Malicious Infrastructure: Phishing Site",
                                 description="Credential harvest target identified in live circulation.",
                                 fields=[
                                     {"name": "Suspected Campaign", "value": f"**{campaign}**", "inline": True},
-                                    {"name": "Hosting Provider / ASN", "value": f"`{net_meta['org']}`", "inline": True},
+                                    {"name": "Hosting / ASN", "value": f"`{net_meta['org'][:22]}`", "inline": True},
+                                    {"name": "Origin Country", "value": f"`{net_meta['country']}`", "inline": True},
+                                    {"name": "DNS Status", "value": f"**{dns_badge}**", "inline": True},
+                                    {"name": "Server IP", "value": f"`{net_meta['ip']}`", "inline": True},
+                                    {"name": "Staging Platform", "value": f"`{host_type}`", "inline": True},
+                                    {"name": "Defanged Link", "value": f"`{defang_url(link)[:120]}`", "inline": False},
+                                    {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Scan on URLScan.io]({urlscan_link})", "inline": False}
+                                ],
+                                color=0x9B59B6 if is_resolved else 0x7F8C8D,
+                                mitre_tactics="T1566.002 Spearphishing Link • T1056.003 Web Portal Capture"
+                            )
+                                title=f"🎣 Malicious Infrastructure: Phishing Site",
+                                description="Credential harvest target identified in live circulation.",
+                                fields=[
+                                    {"name": "Suspected Campaign", "value": f"**{campaign}**", "inline": True},
+                                    {"name": "Hosting / ASN", "value": f"`{net_meta['org'][:22]}`", "inline": True},
                                     {"name": "Origin Country", "value": f"`{net_meta['country']}`", "inline": True},
                                     {"name": "Server IP", "value": f"`{net_meta['ip']}`", "inline": True},
+                                    {"name": "Staging Platform", "value": f"`{host_type}`", "inline": True},
+                                    {"name": "Feed Source", "value": "`OpenPhish Feed`", "inline": True},
                                     {"name": "Defanged Link", "value": f"`{defang_url(link)[:120]}`", "inline": False},
-                                    {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Search on URLScan.io]({urlscan_search})", "inline": False}
+                                    {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Scan on URLScan.io]({urlscan_link})", "inline": False}
                                 ],
                                 color=0x9B59B6,
                                 mitre_tactics="T1566.002 Spearphishing Link • T1056.003 Web Portal Capture"
