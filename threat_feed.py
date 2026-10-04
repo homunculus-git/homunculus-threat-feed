@@ -154,6 +154,8 @@ def get_threat_actor_dossier_links(actor_name: str) -> str:
     return f"**{actor_name}** • " + " | ".join(links)
 
 def classify_research_post(title: str, default_desc: str) -> tuple:
+    title = title or ""
+    default_desc = default_desc or ""
     low = title.lower()
     
     if any(k in low for k in ["macos", "mac os", "osx", "amos", "shub"]):
@@ -243,7 +245,7 @@ async def enrich_dropper_infrastructure(session, raw_url: str) -> dict:
                         strains = {it.get("malware_printable") for it in items if it.get("malware_printable")}
                         info["strains"] = sorted(list(strains))[:4]
                         if len(items) > 0:
-                            info["subnet_note"] = f"⚠️ **Flagged C2 Subnet**: `{len(items)}` neighbor hit(s) in `/24`"
+                            info["subnet_note"] = f"⚠ **Flagged C2 Subnet**: `{len(items)}` neighbor hit(s) in `/24`"
     except Exception:
         pass
     return info
@@ -574,7 +576,10 @@ async def poll_infrastructure(session):
                             record_event(event_id, "URLhaus")
                             detected_family = extract_malware_family(tags)
                             vt_url = get_virustotal_url_link(raw_url)
-                            urlscan_link = f"https://urlscan.io/#{link}"
+                            urlscan_link = (
+                                "https://urlscan.io/"
+                                f"#{urllib.parse.quote(raw_url, safe='')}"
+                            )
                             urlhaus_dossier = f"https://urlhaus.abuse.ch/url/{url_id}/"
                             
                             # Infrastructure Routing & /24 Subnet Threat Intelligence
@@ -599,7 +604,16 @@ async def poll_infrastructure(session):
                                 {"name": "Host Status", "value": f"**{liveness}**", "inline": True},
                                 {"name": "Campaign Tags", "value": f"`{tags or 'None'}`", "inline": True},
                                 {"name": "Defanged Payload Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
-                                    {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Scan on URLScan.io]({urlscan_link}) • [Detonate on Triage](https://triage.geekman.com/?search={raw_url}) • [⚡ Open in Ghidra Lab](http://127.0.0.1:9999/triage?target={urllib.parse.quote(raw_url)})", "inline": False}
+                                {
+                                    "name": "Safe Investigation Sandboxes",
+                                    "value": (
+                                        f"[Scan on VirusTotal]({vt_url}) • "
+                                        f"[Scan on URLScan.io]({urlscan_link}) • "
+                                        f"[Detonate on Triage](https://triage.geekman.com/?search={urllib.parse.quote(raw_url, safe='')}) • "
+                                        f"[⚡ Open in Ghidra Lab](http://127.0.0.1:9999/triage?target={urllib.parse.quote(raw_url, safe='')})"
+                                    ),
+                                    "inline": False
+                                }
                             ])
                             
                             dispatch_discord_embed(
@@ -624,14 +638,17 @@ async def poll_infrastructure(session):
                         if not is_duplicate(event_id):
                             record_event(event_id, "OpenPhish")
                             vt_url = get_virustotal_url_link(link)
-                            urlscan_link = f"https://urlscan.io/#{link}"
+                            urlscan_link = (
+                                "https://urlscan.io/"
+                                f"#{urllib.parse.quote(link, safe='')}"
+                            )
                             campaign = detect_target_campaign(link)
                             
                             net_meta = await resolve_host_metadata(session, link)
                             
                             # Clean host classification & DNS Status
                             is_resolved = net_meta.get("ip") != "Unresolved"
-                            dns_badge = "🟢 Live DNS" if is_resolved else "⚠️ Host currently unresolved"
+                            dns_badge = "🟢 Live DNS" if is_resolved else "⚠ Host currently unresolved"
                             host_type = "Cloud Stager" if any(h in link for h in ["pages.dev", "vercel.app", "netlify.app", "firebaseapp.com"]) else "Self-Hosted / VPS"
 
                             dispatch_discord_embed(
@@ -760,14 +777,15 @@ async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color,
 
         feed = feedparser.parse(xml_data)
         for entry in feed.entries[:3]:
+            entry_link = entry.get("link", "")
             if publisher == "ThreatCluster":
-                event_id = f"tc_{entry.get('id', entry.link)}"
+                event_id = f"tc_{entry.get('id') or entry_link}"
             else:
-                event_id = f"rss_{entry.get('id', entry.link)}"
+                event_id = f"rss_{entry.get('id') or entry_link}"
 
             if not is_duplicate(event_id):
                 record_event(event_id, publisher)
-                raw_title = entry.title
+                raw_title = entry.get("title", "Untitled feed entry")
                 raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
                 clean_text = clean_html_to_markdown(raw_content)
 
@@ -789,20 +807,20 @@ async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color,
                         {"name": "Target Platform", "value": f"`{platform}`", "inline": True},
                         {"name": "Threat Category", "value": f"`{threat_cat}`", "inline": True},
                         {"name": "Investigation Artifacts", "value": "• `Wireshark PCAP (.zip)`\n• `Infection Binaries`\n• `Host/DNS IoC List`", "inline": False},
-                        {"name": "Forensic Dossier", "value": f"[Open Full Analysis & PCAP Download]({entry.link})", "inline": False}
+                        {"name": "Forensic Dossier", "value": f"[Open Full Analysis & PCAP Download]({entry_link})", "inline": False}
                     ]
                     alert_mitre = "T1204 User Execution • T1071 C2 Traffic • T1056 Input Capture"
                 elif publisher == "vx-underground":
                     fields = [
                         {"name": "Source", "value": "`vx-underground Papers Library`", "inline": True},
                         {"name": "Category", "value": "`Reverse Engineering Whitepaper`", "inline": True},
-                        {"name": "Document Link", "value": f"[Download Paper]({entry.link})", "inline": False}
+                        {"name": "Document Link", "value": f"[Download Paper]({entry_link})", "inline": False}
                     ]
                     alert_mitre = "T1588 Obtain Capabilities"
                 else:
                     fields = [
                         {"name": "Publisher", "value": publisher, "inline": True},
-                        {"name": "Details", "value": f"[Open Document / Article]({entry.link})", "inline": False}
+                        {"name": "Details", "value": f"[Open Document / Article]({entry_link})", "inline": False}
                     ]
                     alert_mitre = "T1592 Gather Victim Host Info • T1595 Active Scanning" if "Advisory" in alert_type else "T1588 Obtain Capabilities"
 
