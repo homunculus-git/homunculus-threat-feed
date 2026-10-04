@@ -517,7 +517,7 @@ async def poll_infrastructure(session):
                             fields.extend([
                                 {"name": "Campaign Tags", "value": f"`{tags or 'None'}`", "inline": False},
                                 {"name": "Defanged Payload Link", "value": f"`{defang_url(raw_url)[:120]}`", "inline": False},
-                                {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Search on URLScan.io]({urlscan_search})", "inline": False}
+                                    {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Search on URLScan.io]({urlscan_search})", "inline": False}
                             ])
                             
                             dispatch_discord_embed(
@@ -626,7 +626,7 @@ async def poll_malware_bazaar(session):
                                     {"name": "Signature", "value": f"`{malware}`", "inline": True},
                                     {"name": "File Type", "value": f"`{file_type}`", "inline": True},
                                     {"name": "SHA256", "value": f"`{sha256[:20]}...`", "inline": False},
-                                    {"name": "Hash Analysis", "value": f"[Inspect Binary on VirusTotal]({vt_hash_url})", "inline": False}
+                                    {"name": "Hash Analysis", "value": f"[Inspect on VirusTotal]({vt_hash_url}) • [Detonate on Triage](https://tria.ge/s?q={sha256}) • [⚡ Open in Ghidra Lab](http://127.0.0.1:9999/triage?hash={sha256})", "inline": False}
                                 ],
                                 color=0x95A5A6,
                                 mitre_tactics="T1204 User Execution • T1027 Obfuscated Files"
