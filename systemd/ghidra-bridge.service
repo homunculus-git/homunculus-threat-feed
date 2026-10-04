@@ -1,0 +1,15 @@
+[Unit]
+Description=Optional local Ghidra acquisition bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/homunculus-threat-feed
+ExecStart=/usr/bin/python3 %h/homunculus-threat-feed/ghidra_bridge.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
