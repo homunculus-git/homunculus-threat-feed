@@ -650,21 +650,6 @@ async def poll_infrastructure(session):
                                 color=0x9B59B6 if is_resolved else 0x7F8C8D,
                                 mitre_tactics="T1566.002 Spearphishing Link • T1056.003 Web Portal Capture"
                             )
-                                title=f"🎣 Malicious Infrastructure: Phishing Site",
-                                description="Credential harvest target identified in live circulation.",
-                                fields=[
-                                    {"name": "Suspected Campaign", "value": f"**{campaign}**", "inline": True},
-                                    {"name": "Hosting / ASN", "value": f"`{net_meta['org'][:22]}`", "inline": True},
-                                    {"name": "Origin Country", "value": f"`{net_meta['country']}`", "inline": True},
-                                    {"name": "Server IP", "value": f"`{net_meta['ip']}`", "inline": True},
-                                    {"name": "Staging Platform", "value": f"`{host_type}`", "inline": True},
-                                    {"name": "Feed Source", "value": "`OpenPhish Feed`", "inline": True},
-                                    {"name": "Defanged Link", "value": f"`{defang_url(link)[:120]}`", "inline": False},
-                                    {"name": "Safe Investigation Sandboxes", "value": f"[Scan on VirusTotal]({vt_url}) • [Scan on URLScan.io]({urlscan_link})", "inline": False}
-                                ],
-                                color=0x9B59B6,
-                                mitre_tactics="T1566.002 Spearphishing Link • T1056.003 Web Portal Capture"
-                            )
     except Exception as e:
         print(f"[Collector Error] OpenPhish: {e}")
 
