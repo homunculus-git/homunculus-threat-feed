@@ -262,3 +262,19 @@ The SQLite database (`threat_cache.db`) deduplicates by event ID. To reset:
 ```bash
 rm threat_cache.db
 ```
+
+## Optional local Ghidra acquisition bridge
+
+This repository includes an optional bridge script (`ghidra_bridge.py`) that forwards malware samples from your local Ghidra instance into the Homunculus threat-feed pipeline for enrichment and Discord alerting.
+
+- Bridge script: [`ghidra_bridge.py`](ghidra_bridge.py)
+- Systemd unit (optional): [`systemd/ghidra-bridge.service`](systemd/ghidra-bridge.service)
+- Detailed setup & usage: [`docs/GHIDRA_BRIDGE.md`](docs/GHIDRA_BRIDGE.md)
+
+Typical workflow:
+
+1. Configure Ghidra to call `ghidra_bridge.py` when a new sample is identified.
+2. The bridge writes samples into the configured `samples/` directory and updates `Threat Lab.gpr`.
+3. `threat_feed.py` detects these as local filesystem events and processes them like any other source.
+
+No changes to `threat_feed.py` are required; the bridge is entirely optional and local.
