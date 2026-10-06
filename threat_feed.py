@@ -6,37 +6,58 @@ import html
 import time
 import base64
 import socket
-import sqlite3
+import hashlib
+import ipaddress
 import asyncio
 import aiohttp
-import requests
+import aiosqlite
 import feedparser
 import urllib.parse
 from dotenv import load_dotenv
 
 load_dotenv()
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
+# --- WEBHOOK ROUTING MAP ---
+WEBHOOK_CHANNELS = {
+    "ransomware": os.getenv("DISCORD_WEBHOOK_RANSOMWARE"),
+    "malware": os.getenv("DISCORD_WEBHOOK_MALWARE"),
+    "infrastructure": os.getenv("DISCORD_WEBHOOK_INFRASTRUCTURE"),
+    "phishing": os.getenv("DISCORD_WEBHOOK_PHISHING"),
+    "vulnerabilities": os.getenv("DISCORD_WEBHOOK_VULNERABILITIES"),
+    "gov_advisory": os.getenv("DISCORD_WEBHOOK_GOV_ADVISORY"),
+    "incidents": os.getenv("DISCORD_WEBHOOK_INCIDENTS"),
+}
 
-# --- DATABASE PERSISTENCE (DEDUPLICATION) ---
-conn = sqlite3.connect("threat_cache.db")
-cursor = conn.cursor()
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS seen_events (
-        event_id TEXT PRIMARY KEY,
-        source TEXT,
-        discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
-conn.commit()
+TRIAGE_LAB_HOST = os.getenv("TRIAGE_LAB_HOST", "http://127.0.0.1:9999")
+ABUSECH_AUTH_KEY = os.getenv("ABUSECH_AUTH_KEY", "")
+CONCURRENCY_SEMAPHORE = asyncio.Semaphore(5)
 
-def is_duplicate(event_id: str) -> bool:
-    cursor.execute("SELECT 1 FROM seen_events WHERE event_id = ?", (event_id,))
-    return cursor.fetchone() is not None
+# --- DATABASE PERSISTENCE (NON-BLOCKING ASYNC) ---
+DB_PATH = "threat_cache.db"
 
-def record_event(event_id: str, source: str):
-    cursor.execute("INSERT OR IGNORE INTO seen_events (event_id, source) VALUES (?, ?)", (event_id, source))
-    conn.commit()
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS seen_events (
+                event_id TEXT PRIMARY KEY,
+                source TEXT,
+                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.commit()
+
+async def is_duplicate(event_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM seen_events WHERE event_id = ?", (event_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
+
+async def record_event(event_id: str, source: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO seen_events (event_id, source) VALUES (?, ?)", (event_id, source))
+        await db.commit()
+
+# --- UTILITIES & SANITIZATION ---
 
 def defang_url(url: str) -> str:
     return url.replace("http://", "hxxp://").replace("https://", "hxxps://").replace(".", "[.]")
@@ -51,20 +72,37 @@ def clean_html_to_markdown(raw_html: str) -> str:
     text = html.unescape(raw_html)
     text = re.sub(r'<a\s+(?:[^>]*?\s+)?href="([^"]*)"[^>]*>(.*?)</a>', r'[\2](\1)', text, flags=re.IGNORECASE)
     text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    return re.sub(r'\s+', ' ', text).strip()
 
 def normalize_leak_event_id(group: str, victim: str) -> str:
     clean_group = re.sub(r'[^a-z0-9]', '', (group or "").lower())
     clean_victim = re.sub(r'[^a-z0-9]', '', (victim or "").lower())
     return f"victim_{clean_group}_{clean_victim}"
 
-# --- UNIVERSAL AUTO-TRANSLATOR ENGINE ---
+def get_stable_id(prefix: str, content: str) -> str:
+    digest = hashlib.sha256(content.encode()).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+def is_safe_target(host: str) -> bool:
+    try:
+        ip = socket.gethostbyname(host)
+        ip_obj = ipaddress.ip_address(ip)
+        return not (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or ip_obj.is_link_local)
+    except Exception:
+        return False
+
+# Standard browser headers to avoid Cloudflare/WAF 403 blocks
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+# --- UNIVERSAL ASYNCHRONOUS AUTO-TRANSLATOR ENGINE ---
 TRANSLATION_LOCK = asyncio.Lock()
 TRANSLATION_CACHE = {}
 
-def _sync_translate(text: str) -> tuple[str, bool]:
-    """Translates text to English using Google GTX endpoint with language detection."""
+async def auto_translate_to_english(session: aiohttp.ClientSession, text: str) -> tuple[str, bool]:
     if not text or not text.strip():
         return "", False
 
@@ -74,43 +112,35 @@ def _sync_translate(text: str) -> tuple[str, bool]:
     if sample in TRANSLATION_CACHE:
         return TRANSLATION_CACHE[sample]
 
-    try:
-        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q={urllib.parse.quote(sample[:3000])}"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            # data[2] contains the detected source language (e.g. 'de', 'fr', 'en')
-            detected_lang = data[2] if len(data) > 2 and isinstance(data[2], str) else "auto"
-            
-            # If Google detected English, do not alter or mark as translated
-            if detected_lang.lower().startswith("en"):
-                TRANSLATION_CACHE[sample] = (text, False)
-                return text, False
+    async with TRANSLATION_LOCK:
+        if sample in TRANSLATION_CACHE:
+            return TRANSLATION_CACHE[sample]
 
-            if data and data[0]:
-                res = "".join([segment[0] for segment in data[0] if segment and segment[0]])
-                if res and res.strip().lower() != sample.strip().lower():
-                    # Preserve bracketed metadata tag prefix if one was present
-                    prefix_match = re.match(r'^(\[.*?\]\s*)+', text)
-                    prefix = prefix_match.group(0) if prefix_match else ""
-                    final_res = f"{prefix}{res}".strip()
-                    TRANSLATION_CACHE[sample] = (final_res, True)
-                    return final_res, True
-    except Exception as e:
-        print(f"[Translation Engine Warning] {e}")
+        try:
+            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q={urllib.parse.quote(sample[:3000])}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    detected_lang = data[2] if len(data) > 2 and isinstance(data[2], str) else "auto"
+
+                    if detected_lang.lower().startswith("en"):
+                        TRANSLATION_CACHE[sample] = (text, False)
+                        return text, False
+
+                    if data and data[0]:
+                        res = "".join([segment[0] for segment in data[0] if segment and segment[0]])
+                        if res and res.strip().lower() != sample.strip().lower():
+                            prefix_match = re.match(r'^(\[.*?\]\s*)+', text)
+                            prefix = prefix_match.group(0) if prefix_match else ""
+                            final_res = f"{prefix}{res}".strip()
+                            TRANSLATION_CACHE[sample] = (final_res, True)
+                            await asyncio.sleep(0.2)
+                            return final_res, True
+        except Exception as e:
+            print(f"[Translation Warning] {e}")
 
     TRANSLATION_CACHE[sample] = (text, False)
     return text, False
-
-async def auto_translate_to_english(text: str) -> tuple[str, bool]:
-    """Asynchronously translates foreign content with debounce to prevent rate-limiting."""
-    if not text:
-        return "", False
-    async with TRANSLATION_LOCK:
-        loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(None, _sync_translate, text)
-        await asyncio.sleep(0.2)
-        return res
 
 # --- MITRE ATT&CK & THREAT ACTOR ENRICHMENT ENGINES ---
 
@@ -187,17 +217,17 @@ def classify_research_post(title: str, default_desc: str) -> tuple:
         
     return platform, threat_type, desc
 
-async def resolve_host_metadata(session, raw_url: str) -> dict:
+async def resolve_host_metadata(session: aiohttp.ClientSession, raw_url: str) -> dict:
     try:
         domain = urllib.parse.urlparse(raw_url).netloc.split(":")[0]
-        if not domain:
+        if not domain or not is_safe_target(domain):
             return {"ip": "Unresolved", "org": "Unknown Host", "country": "N/A"}
         
         loop = asyncio.get_running_loop()
         addr_info = await loop.run_in_executor(None, socket.getaddrinfo, domain, None)
         ip = addr_info[0][4][0]
         
-        async with session.get(f"http://ip-api.com/json/{ip}?fields=status,country,isp,org,as", timeout=5) as resp:
+        async with session.get(f"http://ip-api.com/json/{ip}?fields=status,country,isp,org,as", timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("status") == "success":
@@ -207,8 +237,7 @@ async def resolve_host_metadata(session, raw_url: str) -> dict:
     except Exception:
         return {"ip": "Unresolved", "org": "Unknown Host", "country": "N/A"}
 
-async def enrich_dropper_infrastructure(session, raw_url: str) -> dict:
-    """Enriches dropper IP with routing details and queries ThreatFox for /24 neighbor hits."""
+async def enrich_dropper_infrastructure(session: aiohttp.ClientSession, raw_url: str) -> dict:
     info = {
         "ip": None,
         "routing": "Unknown ASN",
@@ -217,7 +246,7 @@ async def enrich_dropper_infrastructure(session, raw_url: str) -> dict:
     }
     try:
         host = urllib.parse.urlparse(raw_url).netloc.split(":")[0]
-        if not host:
+        if not host or not is_safe_target(host):
             return info
             
         loop = asyncio.get_running_loop()
@@ -225,7 +254,7 @@ async def enrich_dropper_infrastructure(session, raw_url: str) -> dict:
         ip = addr_info[0][4][0]
         info["ip"] = ip
         
-        async with session.get(f"http://ip-api.com/json/{ip}?fields=status,country,as,org", timeout=4) as resp:
+        async with session.get(f"http://ip-api.com/json/{ip}?fields=status,country,as,org", timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("status") == "success":
@@ -235,9 +264,10 @@ async def enrich_dropper_infrastructure(session, raw_url: str) -> dict:
                     info["routing"] = f"`{as_num}` {org} ({country})"
                     
         octets = ip.split(".")
-        if len(octets) == 4:
+        if len(octets) == 4 and ABUSECH_AUTH_KEY:
             subnet = f"{octets[0]}.{octets[1]}.{octets[2]}."
-            async with session.post("https://threatfox-api.abuse.ch/api/v1/", json={"query": "search_ioc", "search_term": subnet}, timeout=5) as tf:
+            headers = {"Auth-Key": ABUSECH_AUTH_KEY}
+            async with session.post("https://threatfox-api.abuse.ch/api/v1/", json={"query": "search_ioc", "search_term": subnet}, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as tf:
                 if tf.status == 200:
                     tdata = await tf.json()
                     if tdata.get("query_status") == "ok":
@@ -250,79 +280,29 @@ async def enrich_dropper_infrastructure(session, raw_url: str) -> dict:
         pass
     return info
 
-async def resolve_urlscan_link(session, target_url: str) -> str:
-    """Query URLScan API for the latest scan breakdown or fallback to pre-filled scanner."""
-    try:
-        domain = urllib.parse.urlparse(target_url).netloc
-        api_query = f"https://urlscan.io/api/v1/search/?q=domain:{domain}&size=1"
-        async with session.get(api_query, timeout=3) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                results = data.get("results", [])
-                if results and "_id" in results[0]:
-                    uuid = results[0]["_id"]
-                    return f"https://urlscan.io/result/{uuid}/"
-    except Exception:
-        pass
-    # Fallback directly to scanner homepage with target URL prefilled
-    return f"https://urlscan.io/search/#domain:{urllib.parse.urlparse(target_url).netloc}"
-
-async def resolve_page_title(session, url: str) -> str:
-    """Safely fetch the HTML <title> without downloading full binaries/assets."""
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml",
-        }
-        async with session.get(url, timeout=3, headers=headers, ssl=False, allow_redirects=True) as resp:
-            if resp.status == 200:
-                chunk = await resp.content.read(4096)
-                html_text = chunk.decode("utf-8", errors="ignore")
-                match = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL)
-                if match:
-                    title = match.group(1).strip()
-                    # Clean out excess newlines or spaces
-                    title = " ".join(title.split())
-                    if title and len(title) > 2 and len(title) < 90:
-                        return title
-    except Exception:
-        pass
-    return ""
-
 def detect_target_campaign(url: str) -> str:
     brand_signatures = {
-        # Corporate & Identity Portals
         "Microsoft 365 / Entra ID Harvest": r"office365|microsoft|outlook|sharepoint|onedrive|o365|msft|login\.live|owa|adfs|bpos|mdm|intune",
         "Google Workspace / Accounts": r"google|gmail|accounts-google|gsuite|gdrive|docs-google|drive-google",
         "Apple ID / iCloud Phishing": r"appleid|icloud|apple-id|findmy",
         "Adobe / Document Cloud": r"adobe|acrobat|adobesign",
         "DocuSign Lure Phish": r"docusign|esign|docusg",
-        
-        # Crypto & Web3 Wallets
         "Trezor Hardware Wallet Phish": r"trezor",
         "Ledger Hardware Wallet Phish": r"ledger",
         "MetaMask Web3 Phish": r"metamask",
         "Coinbase Exchange Phish": r"coinbase",
         "Binance Exchange Phish": r"binance|bnance",
         "Phantom Solana Wallet Phish": r"phantom|solflare",
-        
-        # Banking & Financial
         "PayPal Credential Harvest": r"paypal|pypl",
         "JPMorgan Chase Impersonation": r"chase|jpmorgan",
         "Bank of America Impersonation": r"bankofamerica|bofa",
         "Wells Fargo Impersonation": r"wellsfargo",
         "UK / EU Banking Impersonation": r"hsbc|barclays|natwest|lloyds|santander|halifax|revolut",
         "Stripe / Merchant Harvest": r"stripe|merchant-portal",
-        
-        # Delivery & Logistics Scams
         "Postal / Parcel Delivery Scam": r"dhl|parcel|delivery-track|usps|fedex|ups-tracking|post-office|evri",
-        
-        # Telecom & Social / Streaming
         "Netflix / Streaming Scam": r"netflix|spotify",
         "Meta / Facebook / WhatsApp": r"facebook|fb-login|instagram|meta-security|whatsapp",
         "Telecom / Carrier Phishing": r"att-login|verizon|t-mobile|vodafone",
-        
-        # Cloud Platform Abuse (Pages / Workers / Vercel / Netlify / Firebase)
         "Cloudflare Pages Staged Phish": r"pages\.dev",
         "Vercel / Netlify Staged Phish": r"vercel\.app|netlify\.app",
         "Firebase Staged Phish": r"web\.app|firebaseapp\.com",
@@ -333,12 +313,14 @@ def detect_target_campaign(url: str) -> str:
             return label
     return "Unattributed / Generic Credential Phish"
 
-async def check_payload_liveness(session, url: str) -> str:
-    """Quickly probe whether the malware dropper host is live or offline."""
+async def check_payload_liveness(session: aiohttp.ClientSession, url: str) -> str:
     try:
+        domain = urllib.parse.urlparse(url).netloc.split(":")[0]
+        if not is_safe_target(domain):
+            return "🔴 Untrusted Target Host"
         real_url = url.replace("hxxp", "http").replace("[.]", ".")
         headers = {"User-Agent": "Wget/1.21"}
-        async with session.head(real_url, timeout=2.5, headers=headers, ssl=False, allow_redirects=True) as resp:
+        async with session.head(real_url, timeout=aiohttp.ClientTimeout(total=3), headers=headers, allow_redirects=True) as resp:
             if resp.status == 200:
                 length = resp.headers.get("Content-Length")
                 if length and length.isdigit():
@@ -378,8 +360,20 @@ def extract_malware_family(raw_tags: str) -> str:
             
     return "Malware Payload"
 
-def dispatch_discord_embed(title: str, description: str, fields: list, color: int, image_url: str = None, mitre_tactics: str = None):
-    if not DISCORD_WEBHOOK or "discord.com" not in DISCORD_WEBHOOK:
+# --- STRICT DISCORD EMBED ROUTER ---
+
+async def dispatch_discord_embed(
+    session: aiohttp.ClientSession,
+    channel_key: str,
+    title: str,
+    description: str,
+    fields: list,
+    color: int,
+    image_url: str = None,
+    mitre_tactics: str = None
+):
+    target_webhook = WEBHOOK_CHANNELS.get(channel_key)
+    if not target_webhook or "discord.com" not in target_webhook:
         return
     
     footer_text = "Homunculus CTI Core • Automated Threat Stream"
@@ -397,66 +391,86 @@ def dispatch_discord_embed(title: str, description: str, fields: list, color: in
         embed["image"] = {"url": image_url}
 
     payload = {"embeds": [embed]}
-    try:
-        requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-    except Exception as err:
-        print(f"[Discord Error] {err}")
+    for attempt in range(3):
+        try:
+            async with session.post(target_webhook, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 429:
+                    retry_data = await resp.json()
+                    wait_time = float(retry_data.get("retry_after", 1.5))
+                    await asyncio.sleep(wait_time)
+                    continue
+                elif resp.status in (200, 204):
+                    break
+        except Exception:
+            await asyncio.sleep(1)
 
 # --- COLLECTOR TASKS ---
 
-async def poll_leak_trackers(session):
+async def poll_leak_trackers(session: aiohttp.ClientSession):
+    # 1. Ransomware.live Real-Time XML Stream
     try:
-        async with session.get("https://api.ransomware.live/v2/recentvictims", timeout=12) as resp:
+        async with session.get("https://ransomware.live/rss.xml", headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status == 200:
-                for v in (await resp.json())[:6]:
-                    victim = v.get("victim") or "Confidential Victim"
-                    group = v.get("group") or "Unknown"
-                    event_id = normalize_leak_event_id(group, victim)
-                    if not is_duplicate(event_id):
-                        record_event(event_id, "Ransomware.live")
-                        note_text = v.get("description") or "No detailed extortion note disclosed."
-                        clean_note = clean_html_to_markdown(note_text)[:450]
-                        translated_note, was_trans = await auto_translate_to_english(clean_note)
-                        actor_dossier = get_threat_actor_dossier_links(group)
+                feed = feedparser.parse(await resp.text())
+                for entry in feed.entries[:25]:
+                    link = entry.get("link", "")
+                    title = entry.get("title", "")
+                    raw_id = entry.get("id") or link or title
+                    event_id = get_stable_id("rwlive", raw_id)
+
+                    if not await is_duplicate(event_id):
+                        await record_event(event_id, "Ransomware.live")
+                        clean_desc = clean_html_to_markdown(entry.get("summary", "") or entry.get("description", ""))
+                        trans_desc, was_trans = await auto_translate_to_english(session, clean_desc[:450])
                         
+                        group_name = "Ransomware Group"
+                        if " - " in title:
+                            group_name = title.split(" - ")[0].strip()
+                        elif " claimed by " in title.lower():
+                            parts = re.split(r" claimed by ", title, flags=re.IGNORECASE)
+                            group_name = parts[-1].strip()
+
+                        actor_dossier = get_threat_actor_dossier_links(group_name)
                         fields = [
                             {"name": "Threat Actor Dossier", "value": actor_dossier, "inline": False},
-                            {"name": "Target Country", "value": v.get("country", "Global"), "inline": True},
-                            {"name": "Data Claimed", "value": v.get("data_size") or "Unspecified", "inline": True}
+                            {"name": "Discovery Link", "value": f"[Inspect Leak Page]({link})", "inline": False}
                         ]
-                        permalink = v.get("permalink") or v.get("post_url")
-                        if permalink:
-                            fields.append({"name": "Full Extortion Dossier", "value": f"[Inspect Leak Page]({permalink})", "inline": False})
-                        
+
                         prefix = "🚨 Ransomware Alert [Translated]:" if was_trans else "🚨 Ransomware Alert:"
-                        dispatch_discord_embed(
-                            title=f"{prefix} {victim}",
-                            description=f"**Extortion Notice / Group Claim:**\n>>> {translated_note}",
+                        await dispatch_discord_embed(
+                            session=session,
+                            channel_key="ransomware",
+                            title=f"{prefix} {title[:100]}",
+                            description=f"**Extortion Notice / Group Claim:**\n>>> {trans_desc or clean_desc or 'New victim published on extortion leak site.'}",
                             fields=fields,
                             color=0xE74C3C,
-                            image_url=v.get("screenshot"),
                             mitre_tactics="T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service"
                         )
     except Exception as e:
-        print(f"[Collector Error] Ransomware.live: {e}")
+        print(f"[Collector Error] Ransomware.live RSS: {e}")
 
+    # 2. RansomLook API
     try:
-        async with session.get("https://www.ransomlook.io/api/posts?days=1", timeout=12) as resp:
+        async with session.get("https://www.ransomlook.io/api/posts?days=1", headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
             if resp.status == 200:
-                for post in (await resp.json())[:6]:
+                for post in (await resp.json())[:20]:
                     victim = post.get("post_title", "Unknown")
                     group = post.get("group_name", "Unknown")
-                    event_id = normalize_leak_event_id(group, victim)
-                    if not is_duplicate(event_id):
-                        record_event(event_id, "RansomLook")
+                    raw_id = f"{group}_{victim}_{post.get('discovered', '')}"
+                    event_id = get_stable_id("rlook", raw_id)
+
+                    if not await is_duplicate(event_id):
+                        await record_event(event_id, "RansomLook")
                         desc = post.get("description") or "Target listed on double-extortion leak directory."
                         clean_desc = clean_html_to_markdown(desc)[:350]
-                        translated_desc, was_trans = await auto_translate_to_english(clean_desc)
+                        trans_desc, was_trans = await auto_translate_to_english(session, clean_desc)
                         actor_dossier = get_threat_actor_dossier_links(group)
                         prefix = "🚨 Ransomware Alert [Translated]:" if was_trans else "🚨 Ransomware Alert:"
-                        dispatch_discord_embed(
+                        await dispatch_discord_embed(
+                            session=session,
+                            channel_key="ransomware",
                             title=f"{prefix} {victim}",
-                            description=f"**Extortion Claim:**\n>>> {translated_desc}",
+                            description=f"**Extortion Claim:**\n>>> {trans_desc}",
                             fields=[
                                 {"name": "Threat Actor Dossier", "value": actor_dossier, "inline": False},
                                 {"name": "Source", "value": "RansomLook API", "inline": True}
@@ -467,17 +481,22 @@ async def poll_leak_trackers(session):
     except Exception as e:
         print(f"[Collector Error] RansomLook: {e}")
 
+    # 3. Ransomwatch Git Data
     try:
-        async with session.get("https://raw.githubusercontent.com/joshhighet/ransomwatch/main/posts.json", timeout=15) as resp:
+        async with session.get("https://raw.githubusercontent.com/joshhighet/ransomwatch/main/posts.json", timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status == 200:
-                for post in (await resp.json())[-6:]:
+                for post in (await resp.json())[-20:]:
                     victim = post.get("post_title", "Unknown")
                     group = post.get("group_name", "Unknown")
-                    event_id = normalize_leak_event_id(group, victim)
-                    if not is_duplicate(event_id):
-                        record_event(event_id, "Ransomwatch")
+                    raw_id = f"{group}_{victim}_{post.get('discovered', '')}"
+                    event_id = get_stable_id("rwatch", raw_id)
+
+                    if not await is_duplicate(event_id):
+                        await record_event(event_id, "Ransomwatch")
                         actor_dossier = get_threat_actor_dossier_links(group)
-                        dispatch_discord_embed(
+                        await dispatch_discord_embed(
+                            session=session,
+                            channel_key="ransomware",
                             title=f"🚨 Ransomware Alert: {victim}",
                             description=f"Automated crawler detected fresh victim published on **{group}**'s leak site.",
                             fields=[
@@ -490,16 +509,19 @@ async def poll_leak_trackers(session):
     except Exception as e:
         print(f"[Collector Error] Ransomwatch: {e}")
 
-async def poll_infrastructure(session):
+async def poll_infrastructure(session: aiohttp.ClientSession):
+    # Patched Feodo Tracker endpoint
     try:
-        async with session.get("https://feodotracker.abuse.ch/downloads/ipblocklist_recent.json", timeout=12) as resp:
+        async with session.get("https://feodotracker.abuse.ch/downloads/ipblocklist.json", headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
             if resp.status == 200:
                 for s in (await resp.json())[:4]:
                     ip, port, malware = s.get("ip_address"), s.get("port"), s.get("malware", "Botnet")
                     event_id = f"feodo_{ip}_{port}"
-                    if not is_duplicate(event_id):
-                        record_event(event_id, "Feodo")
-                        dispatch_discord_embed(
+                    if not await is_duplicate(event_id):
+                        await record_event(event_id, "Feodo")
+                        await dispatch_discord_embed(
+                            session=session,
+                            channel_key="infrastructure",
                             title=f"🤖 Active C2 Infrastructure: {malware}",
                             description="Active command-and-control server verified by abuse.ch.",
                             fields=[
@@ -513,7 +535,7 @@ async def poll_infrastructure(session):
         print(f"[Collector Error] Feodo: {e}")
 
     try:
-        async with session.get("https://sslbl.abuse.ch/blacklist/sslipblacklist.csv", timeout=12) as resp:
+        async with session.get("https://sslbl.abuse.ch/blacklist/sslipblacklist.csv", headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
             if resp.status == 200:
                 text = await resp.text()
                 reader = csv.reader([line for line in text.splitlines() if not line.startswith("#")])
@@ -521,10 +543,12 @@ async def poll_infrastructure(session):
                     if len(row) >= 3:
                         seen_time, bad_ip, bad_port = row[0].strip(), row[1].strip(), row[2].strip()
                         event_id = f"sslbl_{bad_ip}_{bad_port}"
-                        if not is_duplicate(event_id):
-                            record_event(event_id, "abuse.ch SSLBL")
+                        if not await is_duplicate(event_id):
+                            await record_event(event_id, "abuse.ch SSLBL")
                             vt_ip_url = f"https://www.virustotal.com/gui/ip-address/{bad_ip}"
-                            dispatch_discord_embed(
+                            await dispatch_discord_embed(
+                                session=session,
+                                channel_key="infrastructure",
                                 title="🔒 Malicious SSL Infrastructure: Botnet Node",
                                 description="Host operating a blacklisted SSL/TLS certificate associated with malware C2.",
                                 fields=[
@@ -539,32 +563,7 @@ async def poll_infrastructure(session):
         print(f"[Collector Error] SSLBL: {e}")
 
     try:
-        async with session.get("https://raw.githubusercontent.com/ThreatMon/ThreatMon-Daily-C2-Feeds/main/daily-c2.csv", timeout=12) as resp:
-            if resp.status == 200:
-                text = await resp.text()
-                reader = csv.reader(io.StringIO(text))
-                for row in list(reader)[:4]:
-                    if row and len(row) >= 2 and not row[0].startswith("#"):
-                        c2_ip = row[0].strip()
-                        c2_type = row[1].strip() if len(row) > 1 else "Malicious C2"
-                        event_id = f"tmon_{c2_ip}"
-                        if not is_duplicate(event_id):
-                            record_event(event_id, "ThreatMon")
-                            dispatch_discord_embed(
-                                title="🤖 Active C2 Infrastructure: ThreatMon Feed",
-                                description="Fresh Command & Control endpoint detected by ThreatMon.",
-                                fields=[
-                                    {"name": "Host", "value": f"`{c2_ip}`", "inline": True},
-                                    {"name": "Type", "value": f"`{c2_type}`", "inline": True}
-                                ],
-                                color=0xF1C40F,
-                                mitre_tactics="T1071 Application Layer Protocol"
-                            )
-    except Exception as e:
-        print(f"[Collector Error] ThreatMon: {e}")
-
-    try:
-        async with session.get("https://urlhaus.abuse.ch/downloads/csv_recent/", timeout=12) as resp:
+        async with session.get("https://urlhaus.abuse.ch/downloads/csv_recent/", headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
             if resp.status == 200:
                 text = await resp.text()
                 reader = csv.reader([line for line in text.splitlines() if not line.startswith("#")])
@@ -572,17 +571,13 @@ async def poll_infrastructure(session):
                     if len(row) > 6:
                         url_id, raw_url, threat, tags = row[0].strip(), row[2].strip(), row[5].strip(), row[6].strip()
                         event_id = f"urlhaus_{url_id}"
-                        if not is_duplicate(event_id):
-                            record_event(event_id, "URLhaus")
+                        if not await is_duplicate(event_id):
+                            await record_event(event_id, "URLhaus")
                             detected_family = extract_malware_family(tags)
                             vt_url = get_virustotal_url_link(raw_url)
-                            urlscan_link = (
-                                "https://urlscan.io/"
-                                f"#{urllib.parse.quote(raw_url, safe='')}"
-                            )
+                            urlscan_link = f"https://urlscan.io/#{urllib.parse.quote(raw_url, safe='')}"
                             urlhaus_dossier = f"https://urlhaus.abuse.ch/url/{url_id}/"
                             
-                            # Infrastructure Routing & /24 Subnet Threat Intelligence
                             infra = await enrich_dropper_infrastructure(session, raw_url)
                             
                             fields = [
@@ -609,14 +604,16 @@ async def poll_infrastructure(session):
                                     "value": (
                                         f"[Scan on VirusTotal]({vt_url}) • "
                                         f"[Scan on URLScan.io]({urlscan_link}) • "
-                                        f"[Detonate on Triage](https://triage.geekman.com/?search={urllib.parse.quote(raw_url, safe='')}) • "
-                                        f"[⚡ Open in Ghidra Lab](http://127.0.0.1:9999/triage?target={urllib.parse.quote(raw_url, safe='')})"
+                                        f"[Detonate on Triage](https://tria.ge/reports?q=\" + urllib.parse.urlparse(raw_url).netloc.split(\":\")[0] + \""
+                                        f"[⚡ Open in Ghidra Lab]({TRIAGE_LAB_HOST}/triage?target={urllib.parse.quote(raw_url, safe='')})"
                                     ),
                                     "inline": False
                                 }
                             ])
                             
-                            dispatch_discord_embed(
+                            await dispatch_discord_embed(
+                                session=session,
+                                channel_key="malware",
                                 title=f"☣ Malware Dropper: {detected_family}",
                                 description="Payload distribution URL detected in live malware campaigns.",
                                 fields=fields,
@@ -627,32 +624,28 @@ async def poll_infrastructure(session):
         print(f"[Collector Error] URLhaus: {e}")
 
     try:
-        async with session.get("https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt", timeout=12) as resp:
+        async with session.get("https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt", timeout=aiohttp.ClientTimeout(total=12)) as resp:
             if resp.status == 200:
                 for raw_link in (await resp.text()).splitlines()[:5]:
                     link = raw_link.strip()
                     if link:
                         domain = urllib.parse.urlparse(link).netloc.lower()
-                        # Deduplicate by domain so different paths on same host do not trigger repeat alerts
-                        event_id = f"phish_{domain}" if domain else f"phish_{hash(link)}"
-                        if not is_duplicate(event_id):
-                            record_event(event_id, "OpenPhish")
+                        event_id = f"phish_{domain}" if domain else get_stable_id("phish", link)
+                        if not await is_duplicate(event_id):
+                            await record_event(event_id, "OpenPhish")
                             vt_url = get_virustotal_url_link(link)
-                            urlscan_link = (
-                                "https://urlscan.io/"
-                                f"#{urllib.parse.quote(link, safe='')}"
-                            )
+                            urlscan_link = f"https://urlscan.io/#{urllib.parse.quote(link, safe='')}"
                             campaign = detect_target_campaign(link)
                             
                             net_meta = await resolve_host_metadata(session, link)
-                            
-                            # Clean host classification & DNS Status
                             is_resolved = net_meta.get("ip") != "Unresolved"
                             dns_badge = "🟢 Live DNS" if is_resolved else "⚠ Host currently unresolved"
                             host_type = "Cloud Stager" if any(h in link for h in ["pages.dev", "vercel.app", "netlify.app", "firebaseapp.com"]) else "Self-Hosted / VPS"
 
-                            dispatch_discord_embed(
-                                title=f"🎣 Malicious Infrastructure: Phishing Site",
+                            await dispatch_discord_embed(
+                                session=session,
+                                channel_key="phishing",
+                                title="🎣 Malicious Infrastructure: Phishing Site",
                                 description="Credential harvest target identified in live circulation.",
                                 fields=[
                                     {"name": "Suspected Campaign", "value": f"**{campaign}**", "inline": True},
@@ -670,11 +663,14 @@ async def poll_infrastructure(session):
     except Exception as e:
         print(f"[Collector Error] OpenPhish: {e}")
 
-async def poll_threatfox(session):
+async def poll_threatfox(session: aiohttp.ClientSession):
+    if not ABUSECH_AUTH_KEY:
+        return
     url = "https://threatfox-api.abuse.ch/api/v1/"
+    headers = {"Auth-Key": ABUSECH_AUTH_KEY}
     payload = {"query": "get_iocs", "days": 1}
     try:
-        async with session.post(url, json=payload, timeout=12) as resp:
+        async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
             if resp.status == 200:
                 body = await resp.json()
                 if body.get("query_status") == "ok":
@@ -688,8 +684,8 @@ async def poll_threatfox(session):
                         tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
                         
                         event_id = f"tfox_{ioc_id}"
-                        if not is_duplicate(event_id):
-                            record_event(event_id, "ThreatFox")
+                        if not await is_duplicate(event_id):
+                            await record_event(event_id, "ThreatFox")
                             defanged = defang_url(ioc_val)[:120]
                             tf_url = f"https://threatfox.abuse.ch/ioc/{ioc_id}/"
                             
@@ -702,7 +698,9 @@ async def poll_threatfox(session):
                                 {"name": "Threat Database", "value": f"[View ThreatFox Dossier]({tf_url})", "inline": False}
                             ]
                             
-                            dispatch_discord_embed(
+                            await dispatch_discord_embed(
+                                session=session,
+                                channel_key="infrastructure",
                                 title=f"🎯 Threat Attribution: {malware}",
                                 description="Community intelligence indicator linked to active adversary campaign.",
                                 fields=fields,
@@ -712,11 +710,14 @@ async def poll_threatfox(session):
     except Exception as e:
         print(f"[Collector Error] ThreatFox: {e}")
 
-async def poll_malware_bazaar(session):
+async def poll_malware_bazaar(session: aiohttp.ClientSession):
+    if not ABUSECH_AUTH_KEY:
+        return
     url = "https://mb-api.abuse.ch/api/v1/"
+    headers = {"Auth-Key": ABUSECH_AUTH_KEY}
     data = {"query": "get_recent", "selector": "10"}
     try:
-        async with session.post(url, data=data, timeout=12) as resp:
+        async with session.post(url, data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
             if resp.status == 200:
                 body = await resp.json()
                 if body.get("query_status") == "ok":
@@ -725,17 +726,19 @@ async def poll_malware_bazaar(session):
                         malware = sample.get("signature") or "Unclassified Malware"
                         file_type = sample.get("file_type", "Executable")
                         event_id = f"bazaar_{sha256}"
-                        if not is_duplicate(event_id):
-                            record_event(event_id, "MalwareBazaar")
+                        if not await is_duplicate(event_id):
+                            await record_event(event_id, "MalwareBazaar")
                             vt_hash_url = f"https://www.virustotal.com/gui/file/{sha256}"
-                            dispatch_discord_embed(
+                            await dispatch_discord_embed(
+                                session=session,
+                                channel_key="malware",
                                 title=f"🔬 New Malware Sample: {malware}",
                                 description=f"A fresh `{file_type}` payload was staged and identified.",
                                 fields=[
                                     {"name": "Signature", "value": f"`{malware}`", "inline": True},
                                     {"name": "File Type", "value": f"`{file_type}`", "inline": True},
                                     {"name": "SHA256", "value": f"`{sha256[:20]}...`", "inline": False},
-                                    {"name": "Hash Analysis", "value": f"[Inspect on VirusTotal]({vt_hash_url}) • [Detonate on Triage](https://tria.ge/s?q={sha256}) • [⚡ Open in Ghidra Lab](http://127.0.0.1:9999/triage?hash={sha256})", "inline": False}
+                                    {"name": "Hash Analysis", "value": f"[Inspect on VirusTotal]({vt_hash_url}) • [Detonate on Triage](https://tria.ge/reports?q={sha256}) • [⚡ Open in Ghidra Lab]({TRIAGE_LAB_HOST}/triage?hash={sha256})", "inline": False}
                                 ],
                                 color=0x95A5A6,
                                 mitre_tactics="T1204 User Execution • T1027 Obfuscated Files"
@@ -743,17 +746,19 @@ async def poll_malware_bazaar(session):
     except Exception as e:
         print(f"[Collector Error] MalwareBazaar: {e}")
 
-async def poll_vulnerabilities(session):
+async def poll_vulnerabilities(session: aiohttp.ClientSession):
     try:
-        async with session.get("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", timeout=12) as resp:
+        async with session.get("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
             if resp.status == 200:
                 for vuln in (await resp.json()).get("vulnerabilities", [])[-5:]:
                     cve_id = vuln.get("cveID")
                     event_id = f"cisa_{cve_id}".lower()
-                    if not is_duplicate(event_id):
-                        record_event(event_id, "CISA-KEV")
+                    if not await is_duplicate(event_id):
+                        await record_event(event_id, "CISA-KEV")
                         is_ransom = vuln.get("knownRansomwareCampaignUse", "Unknown")
-                        dispatch_discord_embed(
+                        await dispatch_discord_embed(
+                            session=session,
+                            channel_key="vulnerabilities",
                             title=f"🦠 Vulnerability Alert: {cve_id}",
                             description=clean_html_to_markdown(vuln.get("shortDescription", "Actively exploited vulnerability.")),
                             fields=[
@@ -767,116 +772,107 @@ async def poll_vulnerabilities(session):
     except Exception as e:
         print(f"[Collector Error] CISA KEV: {e}")
 
-async def fetch_and_process_rss(session, publisher, feed_url, alert_type, color, may_need_translation=False):
-    try:
-        headers = {"User-Agent": "HomunculusCTI/2.0 (+https://github.com/homunculus-git)"}
-        async with session.get(feed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return
-            xml_data = await resp.text()
+async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, feed_url: str, alert_type: str, color: int, channel_key: str, may_need_translation: bool = False):
+    async with CONCURRENCY_SEMAPHORE:
+        try:
+            async with session.get(feed_url, headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status != 200:
+                    return
+                xml_data = await resp.text()
 
-        feed = feedparser.parse(xml_data)
-        for entry in feed.entries[:3]:
-            entry_link = entry.get("link", "")
-            if publisher == "ThreatCluster":
-                event_id = f"tc_{entry.get('id') or entry_link}"
-            else:
-                event_id = f"rss_{entry.get('id') or entry_link}"
+            feed = feedparser.parse(xml_data)
+            for entry in feed.entries[:3]:
+                entry_link = entry.get("link", "")
+                raw_id = entry.get("id") or entry_link
+                event_id = f"tc_{raw_id}" if publisher == "ThreatCluster" else get_stable_id("rss", raw_id)
 
-            if not is_duplicate(event_id):
-                record_event(event_id, publisher)
-                raw_title = entry.get("title", "Untitled feed entry")
-                raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
-                clean_text = clean_html_to_markdown(raw_content)
+                if not await is_duplicate(event_id):
+                    await record_event(event_id, publisher)
+                    raw_title = entry.get("title", "Untitled feed entry")
+                    raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
+                    clean_text = clean_html_to_markdown(raw_content)
 
-                # Only translate feeds marked as potentially foreign (CERT-Bund, CERT-FR, etc.)
-                if may_need_translation:
-                    final_title, title_was_foreign = await auto_translate_to_english(raw_title)
-                    final_desc, desc_was_foreign = await auto_translate_to_english(clean_text)
-                    if title_was_foreign or desc_was_foreign:
-                        display_title = f"{alert_type} [Translated]: {final_title}"
+                    if may_need_translation:
+                        final_title, title_was_foreign = await auto_translate_to_english(session, raw_title)
+                        final_desc, desc_was_foreign = await auto_translate_to_english(session, clean_text)
+                        display_title = f"{alert_type} [Translated]: {final_title}" if (title_was_foreign or desc_was_foreign) else f"{alert_type}: {raw_title}"
                     else:
+                        final_desc = clean_text
                         display_title = f"{alert_type}: {raw_title}"
-                else:
-                    final_desc = clean_text
-                    display_title = f"{alert_type}: {raw_title}"
 
-                if publisher == "Malware Traffic Analysis":
-                    platform, threat_cat, final_desc = classify_research_post(display_title, final_desc)
-                    fields = [
-                        {"name": "Target Platform", "value": f"`{platform}`", "inline": True},
-                        {"name": "Threat Category", "value": f"`{threat_cat}`", "inline": True},
-                        {"name": "Investigation Artifacts", "value": "• `Wireshark PCAP (.zip)`\n• `Infection Binaries`\n• `Host/DNS IoC List`", "inline": False},
-                        {"name": "Forensic Dossier", "value": f"[Open Full Analysis & PCAP Download]({entry_link})", "inline": False}
-                    ]
-                    alert_mitre = "T1204 User Execution • T1071 C2 Traffic • T1056 Input Capture"
-                elif publisher == "vx-underground":
-                    fields = [
-                        {"name": "Source", "value": "`vx-underground Papers Library`", "inline": True},
-                        {"name": "Category", "value": "`Reverse Engineering Whitepaper`", "inline": True},
-                        {"name": "Document Link", "value": f"[Download Paper]({entry_link})", "inline": False}
-                    ]
-                    alert_mitre = "T1588 Obtain Capabilities"
-                else:
-                    fields = [
-                        {"name": "Publisher", "value": publisher, "inline": True},
-                        {"name": "Details", "value": f"[Open Document / Article]({entry_link})", "inline": False}
-                    ]
-                    alert_mitre = "T1592 Gather Victim Host Info • T1595 Active Scanning" if "Advisory" in alert_type else "T1588 Obtain Capabilities"
+                    if publisher == "Malware Traffic Analysis":
+                        platform, threat_cat, final_desc = classify_research_post(display_title, final_desc)
+                        fields = [
+                            {"name": "Target Platform", "value": f"`{platform}`", "inline": True},
+                            {"name": "Threat Category", "value": f"`{threat_cat}`", "inline": True},
+                            {"name": "Investigation Artifacts", "value": "• `Wireshark PCAP (.zip)`\n• `Infection Binaries`\n• `Host/DNS IoC List`", "inline": False},
+                            {"name": "Forensic Dossier", "value": f"[Open Full Analysis & PCAP Download]({entry_link})", "inline": False}
+                        ]
+                        alert_mitre = "T1204 User Execution • T1071 C2 Traffic • T1056 Input Capture"
+                    elif publisher == "vx-underground":
+                        fields = [
+                            {"name": "Source", "value": "`vx-underground Papers Library`", "inline": True},
+                            {"name": "Category", "value": "`Reverse Engineering Whitepaper`", "inline": True},
+                            {"name": "Document Link", "value": f"[Download Paper]({entry_link})", "inline": False}
+                        ]
+                        alert_mitre = "T1588 Obtain Capabilities"
+                    else:
+                        fields = [
+                            {"name": "Publisher", "value": publisher, "inline": True},
+                            {"name": "Details", "value": f"[Open Document / Article]({entry_link})", "inline": False}
+                        ]
 
-                dispatch_discord_embed(
-                    title=display_title,
-                    description=final_desc[:1900] + ("..." if len(final_desc) >= 1900 else ""),
-                    fields=fields,
-                    color=color,
-                    mitre_tactics=alert_mitre
-                )
-    except asyncio.TimeoutError:
-        pass
-    except Exception as e:
-        print(f"[RSS Error] {publisher}: {e}")
+                    await dispatch_discord_embed(
+                        session=session,
+                        channel_key=channel_key,
+                        title=display_title,
+                        description=final_desc[:1900] + ("..." if len(final_desc) >= 1900 else ""),
+                        fields=fields,
+                        color=color,
+                        mitre_tactics="T1592 Gather Victim Host Info"
+                    )
+        except Exception:
+            pass
 
-async def poll_rss_streams(session):
-    # (Publisher, Feed URL, Alert Type, Color, May Need Translation)
-    # Feeds that are exclusively English (CISA, NCSC, THN, etc.) have False to save rate limits.
+async def poll_rss_streams(session: aiohttp.ClientSession):
+    # Patched and updated RSS catalog
     rss_catalog = [
-        ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡 Government Advisory", 0x2980B9, False),
-        ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡 Government Advisory", 0x2980B9, False),
-        ("CISA ICS", "https://www.cisa.gov/rss/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400, False),
-        ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡 Government Advisory", 0x2980B9, True),
-        ("CERT-EU", "https://cert.europa.eu/publications/security-advisories/rss.xml", "🛡 Government Advisory", 0x2980B9, True),
-        ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡 Government Advisory", 0x2980B9, True),
-        ("CERT NZ", "https://www.cert.govt.nz/it-specialists/advisories/rss", "🛡 Government Advisory", 0x2980B9, False),
-        ("ACSC Australia", "https://www.cyber.gov.au/rss/alerts.xml", "🛡 Government Advisory", 0x2980B9, False),
-        ("Canadian Cyber Centre", "https://cyber.gc.ca/api/v1/feed/cyber-advisories/en", "🛡 Government Advisory", 0x2980B9, False),
-        ("Malware Traffic Analysis", "https://www.malware-traffic-analysis.net/blog-entries.rss", "🔬 PCAP & Infection Chain", 0x1ABC9C, False),
-        ("vx-underground", "https://vx-underground.org/rss/papers.xml", "🧬 Malware Research & Analysis", 0x8E44AD, False),
-        ("nao_sec", "https://nao-sec.org/feed", "🔬 Independent Threat Hunting", 0x1ABC9C, True),
-        ("BornCity Security", "https://borncity.com/win/feed/", "⚡ Breaking IT & Zero-Day Report", 0x3498DB, True),
-        ("Krebs on Security", "https://krebsonsecurity.com/feed/", "📰 Cybercrime Investigation", 0x2ECC71, False),
-        ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C, False),
-        ("Malpedia", "https://malpedia.caad.fkie.fraunhofer.de/rss", "🧬 Threat Actor Taxonomy Update", 0x8E44AD, False),
-        ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB, False),
-        ("Exploit-DB", "https://www.exploit-db.com/rss.xml", "💥 Exploit PoC Alert", 0xE91E63, False),
-        ("Packet Storm", "https://packetstorm.news/rss/files", "💥 Exploit PoC Alert", 0xE91E63, False),
-        ("AssureStart CVE", "https://cve.assurestart.co/api/feed.xml?cvss_min=9", "🦠 Vulnerability Alert", 0xE67E22, False),
-        ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71, False),
-        ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71, False),
-        ("ThreatCluster", "https://threatcluster.io/dark-web/feed.xml", "🚨 Dark Web Victim Stream", 0xE74C3C, True)
+        ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡 Government Advisory", 0x2980B9, "gov_advisory", False),
+        ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡 Government Advisory", 0x2980B9, "gov_advisory", False),
+        ("CISA ICS", "https://www.securityweek.com/feed/", "🏭 Industrial Control Systems Alert", 0xD35400, "gov_advisory", False),
+        ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡 Government Advisory", 0x2980B9, "gov_advisory", True),
+        ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡 Government Advisory", 0x2980B9, "gov_advisory", True),
+        ("Canadian Cyber", "https://www.cyber.gc.ca/api/v1/feed/cyber-advisories/en", "🛡 Government Advisory", 0x2980B9, "gov_advisory", False),
+        ("Malware Traffic Analysis", "https://www.malware-traffic-analysis.net/blog-entries.rss", "🔬 PCAP & Infection Chain", 0x1ABC9C, "malware", False),
+        ("vx-underground", "https://vx-underground.org/rss/papers.xml", "🧬 Malware Research & Analysis", 0x8E44AD, "malware", False),
+        ("nao_sec", "https://nao-sec.org/feed", "🔬 Independent Threat Hunting", 0x1ABC9C, "malware", True),
+        ("BornCity Security", "https://borncity.com/win/feed/", "⚡ Breaking IT & Zero-Day Report", 0x3498DB, "incidents", True),
+        ("Krebs on Security", "https://krebsonsecurity.com/feed/", "📰 Cybercrime Investigation", 0x2ECC71, "incidents", False),
+        ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C, "malware", False),
+        ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB, "incidents", False),
+        ("Exploit-DB", "https://www.exploit-db.com/rss.xml", "💥 Exploit PoC Alert", 0xE91E63, "vulnerabilities", False),
+        ("Packet Storm", "https://packetstorm.news/rss/files", "💥 Exploit PoC Alert", 0xE91E63, "vulnerabilities", False),
+        ("ThreatCluster Vulns", "https://threatcluster.io/vulnerabilities/feed.xml", "🦠 Vulnerability Alert", 0xE67E22, "vulnerabilities", False),
+        ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71, "incidents", False),
+        ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71, "incidents", False),
+        ("ThreatCluster", "https://threatcluster.io/dark-web/feed.xml", "🚨 Dark Web Victim Stream", 0xE74C3C, "ransomware", True)
     ]
     
     rss_tasks = [
-        fetch_and_process_rss(session, pub, url, a_type, color, trans_flag)
-        for pub, url, a_type, color, trans_flag in rss_catalog
+        fetch_and_process_rss(session, pub, url, a_type, color, ch_key, trans_flag)
+        for pub, url, a_type, color, ch_key, trans_flag in rss_catalog
     ]
     await asyncio.gather(*rss_tasks, return_exceptions=True)
 
-# --- ORCHESTRATION ---
+# --- ENGINE ORCHESTRATION ---
 
 async def main():
-    print("[*] Homunculus 32-Source Threat Intelligence Stream Running (Selective Auto-Translation & Subnet Intelligence Active).")
-    while True:
-        async with aiohttp.ClientSession() as session:
+    await init_db()
+    print("[*] Threat Feed Engine Active with Corrected Endpoints, Triage Sandbox Links, and Multi-Channel Routing.")
+    
+    connector = aiohttp.TCPConnector(limit=15, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        while True:
             await asyncio.gather(
                 poll_leak_trackers(session),
                 poll_infrastructure(session),
@@ -886,7 +882,7 @@ async def main():
                 poll_rss_streams(session),
                 return_exceptions=True
             )
-        await asyncio.sleep(300)
+            await asyncio.sleep(300)
 
 if __name__ == "__main__":
     asyncio.run(main())
