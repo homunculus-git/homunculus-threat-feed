@@ -434,7 +434,42 @@ async def poll_leak_trackers(session: aiohttp.ClientSession):
                         fields = [
                             {"name": "Threat Actor Dossier", "value": actor_dossier, "inline": False},
                             {"name": "Discovery Link", "value": f"[Inspect Leak Page]({link})", "inline": False}
-                        ]
+                            ("Have I Been Pwned", "https://haveibeenpwned.com/feed/breaches/", "🚨 Data Breach Notification", 0xE74C3C, "ransomware", False),
+        ("DataBreaches.net", "https://www.databreaches.net/feed/", "🚨 Leak Site Incident", 0xE74C3C, "ransomware", False),
+        ("Google TAG", "https://blog.google/threat-analysis-group/rss/", "🔬 Nation-State APT Report", 0x1ABC9C, "research", False),
+        ("SentinelLabs", "https://www.sentinelone.com/labs/feed/", "🔬 In-Depth Malware Analysis", 0x1ABC9C, "research", False),
+        ("Red Canary Intel", "https://redcanary.com/blog/threat-intelligence/feed/", "🔬 Adversary Tradecraft", 0x1ABC9C, "research", False),
+        ("Zero Day Initiative", "https://www.zerodayinitiative.com/blog?format=rss", "💥 Vulnerability & PoC Advisory", 0xE67E22, "vulnerabilities", False),
+        ("Cybersecurity Headlines", "https://cisoseries.libsyn.com/rss", "🎙 Daily Audio Briefing", 0x3498DB, "podcasts", False),
+        ("SANS Stormcast", "https://isc.sans.edu/podcast.rss", "🎙 Daily Audio Briefing", 0x3498DB, "podcasts", False),
+        ("Risky Business", "https://risky.biz/feeds/risky-business", "🎙 Industry Podcast", 0x3498DB, "podcasts", False),
+        ("Darknet Diaries", "https://podcast.darknetdiaries.com/", "🎧 Darknet Stories", 0x9B59B6, "podcasts", False),
+        ("Smashing Security", "https://www.smashingsecurity.com/rss", "🎙 Security & Tech Podcast", 0x3498DB, "podcasts", False),
+        ("ShadowTalk", "https://shadowtalk.libsyn.com/rss", "🎙 Threat Intel Podcast", 0x3498DB, "podcasts", False),
+        ("Hacker and the Fed", "https://feeds.megaphone.fm/hackerandthefed", "🎙 Security Case Studies", 0x3498DB, "podcasts", False),
+        ("Defensive Security", "https://defensivesecurity.org/feed/podcast", "🎙 Blue Team Analysis", 0x3498DB, "podcasts", False),
+        ("CISO Series Podcast", "https://cisoseries.com/feed/podcast/", "🎙 Security Leadership", 0x3498DB, "podcasts", False),
+        ("2.5 Admins", "https://2.5admins.com/feed/podcast", "🎙 Sysadmin & Ops Discussion", 0x3498DB, "podcasts", False),
+        ("Cloud Security Podcast", "https://feeds.buzzsprout.com/743477.rss", "🎙 Cloud Architecture & IAM", 0x3498DB, "podcasts", False),
+        ("AI Security Podcast", "https://feeds.buzzsprout.com/2242131.rss", "🎙 AI Safety & LLM Red Teaming", 0x3498DB, "podcasts", False),
+        ("Cybersecurity Defenders", "https://feeds.buzzsprout.com/2095909.rss", "🎙 Detection & SOC Triage", 0x3498DB, "podcasts", False),
+        ("Adversary Universe", "https://feeds.buzzsprout.com/1826048.rss", "🎙 Threat Actor Profiling", 0x3498DB, "podcasts", False),
+        ("Cyber Threat Perspective", "https://anchor.fm/s/5713437c/podcast/rss", "🎙 Adversary Hunting", 0x3498DB, "podcasts", False),
+        ("What the Hack", "https://feeds.megaphone.fm/whatthehack", "🎙 Scam & Fraud Breakdown", 0x3498DB, "podcasts", False),
+        ("Hacked", "https://feeds.megaphone.fm/hacked", "🎙 Cybercrime Narrative", 0x3498DB, "podcasts", False),
+        ("Error Code", "https://errorcode.libsyn.com/rss", "🎙 IoT & Embedded Security", 0x3498DB, "podcasts", False),
+        ("Dev Interrupted", "https://feeds.buzzsprout.com/1126172.rss", "🎙 DevSecOps & Architecture", 0x3498DB, "podcasts", False),
+        ("Cyber Uncut", "https://www.defenceconnect.com.au/rss/podcasts/cyber-uncut", "🎙 National Cyber Policy", 0x3498DB, "podcasts", False),
+        ("SANS Stormcast", "https://isc.sans.edu/podcast.rss", "🎙 Daily Audio Briefing", 0x3498DB, "podcasts", False),
+        ("CyberWire Daily", "https://feeds.megaphone.fm/cyberwire-daily-podcast", "🎙 Daily Audio Briefing", 0x3498DB, "podcasts", False),
+        ("Hacking Humans", "https://feeds.megaphone.fm/CSN1771344706", "🎙 Social Engineering & Scams", 0x9B59B6, "podcasts", False),
+        ("Late Night Linux", "https://latenightlinux.com/feeds/latenightlinux.xml", "🎙 Linux & Systems Ops", 0x2ECC71, "podcasts", False),
+        ("Daily Cyber Threat Brief", "https://feeds.transistor.fm/daily-cyber-threat-brief", "🎙 Threat Briefing", 0x3498DB, "podcasts", False),
+        ("Cybersecurity Today", "https://cybersecuritytoday.libsyn.com/rss", "🎙 Daily Infosec News", 0x3498DB, "podcasts", False),
+        ("Microsoft Threat Intel", "https://feeds.megaphone.fm/CSN8334463375", "🎙 Microsoft Research", 0x00A4EF, "podcasts", False),
+        ("Secure AF", "https://feeds.buzzsprout.com/660007.rss", "🎙 Tactical Red/Blue Team", 0xE67E22, "podcasts", False),
+        ("WIRED Security", "https://www.wired.com/feed/category/security/latest/rss", "📰 Investigative Journalism", 0xE91E63, "podcasts", False),
+    ]
 
                         prefix = "🚨 Ransomware Alert [Translated]:" if was_trans else "🚨 Ransomware Alert:"
                         await dispatch_discord_embed(
@@ -604,7 +639,7 @@ async def poll_infrastructure(session: aiohttp.ClientSession):
                                     "value": (
                                         f"[Scan on VirusTotal]({vt_url}) • "
                                         f"[Scan on URLScan.io]({urlscan_link}) • "
-                                        f"[Detonate on Triage](https://tria.ge/reports?q=\" + urllib.parse.urlparse(raw_url).netloc.split(\":\")[0] + \""
+                                        f"[Search on Triage](https://tria.ge/reports?q={urllib.parse.urlparse(raw_url).netloc.split(':')[0]}) • "
                                         f"[⚡ Open in Ghidra Lab]({TRIAGE_LAB_HOST}/triage?target={urllib.parse.quote(raw_url, safe='')})"
                                     ),
                                     "inline": False
@@ -772,6 +807,38 @@ async def poll_vulnerabilities(session: aiohttp.ClientSession):
     except Exception as e:
         print(f"[Collector Error] CISA KEV: {e}")
 
+
+def condense_podcast_summary(raw_html: str, max_points: int = 10) -> str:
+    """Extracts up to 10 clean, sponsor-free bullet takeaways from show notes."""
+    if not raw_html:
+        return "Episode published with no detailed show notes."
+    
+    text = clean_html_to_markdown(raw_html)
+    
+    # Strip sponsor messages, promo codes, and marketing boilerplate
+    ad_patterns = [
+        r'(?i)thanks to our sponsor.*',
+        r'(?i)sponsored by.*',
+        r'(?i)check out our patreon.*',
+        r'(?i)support us on patreon.*',
+        r'(?i)use promo code.*',
+        r'(?i)visit https?://[^\s]+ for \d+% off.*',
+        r'(?i)music by.*'
+    ]
+    for pat in ad_patterns:
+        text = re.sub(pat, '', text)
+    
+    # Split by line breaks or sentences
+    lines = [l.strip(" -•*") for l in re.split(r'[
+
+]+|\.\s+', text) if len(l.strip()) > 20]
+    
+    key_points = lines[:max_points]
+    if not key_points:
+        return text[:400] + "..." if len(text) > 400 else text
+
+    return "\n".join([f"• {point.strip('.')}" for point in key_points])
+
 async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, feed_url: str, alert_type: str, color: int, channel_key: str, may_need_translation: bool = False):
     async with CONCURRENCY_SEMAPHORE:
         try:
@@ -781,7 +848,7 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
                 xml_data = await resp.text()
 
             feed = feedparser.parse(xml_data)
-            for entry in feed.entries[:3]:
+            for entry in feed.entries[:6]:
                 entry_link = entry.get("link", "")
                 raw_id = entry.get("id") or entry_link
                 event_id = f"tc_{raw_id}" if publisher == "ThreatCluster" else get_stable_id("rss", raw_id)
@@ -790,7 +857,14 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
                     await record_event(event_id, publisher)
                     raw_title = entry.get("title", "Untitled feed entry")
                     raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
-                    clean_text = clean_html_to_markdown(raw_content)
+                    if channel_key == "podcasts" or "🎙" in alert_type or "🎧" in alert_type:
+                        clean_text = condense_podcast_summary(raw_content, max_points=10)
+                        audio_url = None
+                        if hasattr(entry, "enclosures") and entry.enclosures:
+                            audio_url = entry.enclosures[0].get("href")
+                    else:
+                        clean_text = clean_html_to_markdown(raw_content)
+                        audio_url = None
 
                     if may_need_translation:
                         final_title, title_was_foreign = await auto_translate_to_english(session, raw_title)
@@ -821,6 +895,93 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
                             {"name": "Publisher", "value": publisher, "inline": True},
                             {"name": "Details", "value": f"[Open Document / Article]({entry_link})", "inline": False}
                         ]
+                        if audio_url:
+                            fields.append({"name": "Audio Stream", "value": f"[▶ Listen to Episode (MP3)]({audio_url})", "inline": False})
+
+                        if publisher == "ThreatCluster":
+                            actor_text = raw_title.split("— claimed by", 1)[-1].strip() if "— claimed by" in raw_title else "Unattributed"
+                            actor_key = re.sub(r"[^a-z0-9]", "", actor_text.lower())
+
+                            actor_profiles = {
+                                "lockbit": {
+                                    "actor": "LockBit",
+                                    "active_since": "2019",
+                                    "motivation": "Financially motivated ransomware / extortion",
+                                    "ttps": "T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service • T1059 Command Scripting",
+                                    "research": "[MITRE G0092](https://attack.mitre.org/groups/G0092/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.lockbit)"
+                                },
+                                "cl0p": {
+                                    "actor": "CL0P",
+                                    "active_since": "2019",
+                                    "motivation": "Financially motivated data theft & zero-day extortion",
+                                    "ttps": "T1190 Exploit Public-Facing App • T1567 Exfiltration Over Web Service",
+                                    "research": "[MITRE G0096](https://attack.mitre.org/groups/G0096/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.clop)"
+                                },
+                                "blackcat": {
+                                    "actor": "BlackCat / ALPHV",
+                                    "active_since": "2021",
+                                    "motivation": "Financially motivated double-extortion RaaS",
+                                    "ttps": "T1486 Data Encrypted for Impact • T1059 Command Scripting",
+                                    "research": "[MITRE G1017](https://attack.mitre.org/groups/G1017/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.blackcat)"
+                                },
+                                "qilin": {
+                                    "actor": "Qilin (Agenda)",
+                                    "active_since": "2022",
+                                    "motivation": "Financially motivated Rust/Go ransomware-as-a-service",
+                                    "ttps": "T1486 Data Encrypted for Impact • T1059 Command Scripting • T1567 Exfiltration",
+                                    "research": "[MITRE G1050](https://attack.mitre.org/groups/G1050/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/elf.qilin)"
+                                },
+                                "akira": {
+                                    "actor": "Akira",
+                                    "active_since": "2023",
+                                    "motivation": "Financially motivated double-extortion enterprise RaaS",
+                                    "ttps": "T1133 External Remote Services • T1486 Data Encrypted for Impact",
+                                    "research": "[MITRE G1024](https://attack.mitre.org/groups/G1024/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.akira)"
+                                },
+                                "play": {
+                                    "actor": "Play Ransomware",
+                                    "active_since": "2022",
+                                    "motivation": "Financially motivated extortion & credential abuse",
+                                    "ttps": "T1190 Exploit Public App • T1059 Command Scripting",
+                                    "research": "[MITRE G1019](https://attack.mitre.org/groups/G1019/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.play)"
+                                },
+                                "blackbasta": {
+                                    "actor": "Black Basta",
+                                    "active_since": "2022",
+                                    "motivation": "Financially motivated targeted extortion RaaS",
+                                    "ttps": "T1566 Spearphishing • T1486 Data Encrypted for Impact",
+                                    "research": "[MITRE G1011](https://attack.mitre.org/groups/G1011/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.blackbasta)"
+                                },
+                                "ransomhub": {
+                                    "actor": "RansomHub",
+                                    "active_since": "2024",
+                                    "motivation": "Financially motivated high-payout double-extortion RaaS",
+                                    "ttps": "T1486 Data Encrypted for Impact • T1567 Exfiltration",
+                                    "research": "[MITRE G1040](https://attack.mitre.org/groups/G1040/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.ransomhub)"
+                                }
+                            }
+
+                            profile = actor_profiles.get(actor_key)
+                            if profile:
+                                fields.append({
+                                    "name": "Threat Actor Dossier",
+                                    "value": (
+                                        f"**Actor:** {profile['actor']} (Active since {profile['active_since']})\n"
+                                        f"**Motivation:** {profile['motivation']}\n"
+                                        f"**Common ATT&CK:** {profile['ttps']}\n"
+                                        f"**Dossier Research:** {profile['research']}"
+                                    ),
+                                    "inline": False
+                                })
+                            else:
+                                search_actor = urllib.parse.quote(actor_text)
+                                fields.append({
+                                    "name": "Threat Actor",
+                                    "value": f"**{actor_text}** • [Search MITRE](https://attack.mitre.org/?q={search_actor}) • [Search Malpedia](https://malpedia.caad.fkie.fraunhofer.de/search#query={search_actor})",
+                                    "inline": False
+                                })
+
+                        alert_mitre = "T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service" if publisher == "ThreatCluster" else ("T1592 Gather Victim Host Info • T1595 Active Scanning" if "Advisory" in alert_type else "T1588 Obtain Capabilities")
 
                     await dispatch_discord_embed(
                         session=session,
@@ -829,7 +990,7 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
                         description=final_desc[:1900] + ("..." if len(final_desc) >= 1900 else ""),
                         fields=fields,
                         color=color,
-                        mitre_tactics="T1592 Gather Victim Host Info"
+                        mitre_tactics=alert_mitre
                     )
         except Exception:
             pass
@@ -843,12 +1004,12 @@ async def poll_rss_streams(session: aiohttp.ClientSession):
         ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡 Government Advisory", 0x2980B9, "gov_advisory", True),
         ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡 Government Advisory", 0x2980B9, "gov_advisory", True),
         ("Canadian Cyber", "https://www.cyber.gc.ca/api/v1/feed/cyber-advisories/en", "🛡 Government Advisory", 0x2980B9, "gov_advisory", False),
-        ("Malware Traffic Analysis", "https://www.malware-traffic-analysis.net/blog-entries.rss", "🔬 PCAP & Infection Chain", 0x1ABC9C, "malware", False),
-        ("vx-underground", "https://vx-underground.org/rss/papers.xml", "🧬 Malware Research & Analysis", 0x8E44AD, "malware", False),
-        ("nao_sec", "https://nao-sec.org/feed", "🔬 Independent Threat Hunting", 0x1ABC9C, "malware", True),
+        ("Malware Traffic Analysis", "https://www.malware-traffic-analysis.net/blog-entries.rss", "🔬 PCAP & Infection Chain", 0x1ABC9C, "research", False),
+        ("vx-underground", "https://vx-underground.org/rss/papers.xml", "🧬 Malware Research & Analysis", 0x8E44AD, "research", False),
+        ("nao_sec", "https://nao-sec.org/feed", "🔬 Independent Threat Hunting", 0x1ABC9C, "research", True),
         ("BornCity Security", "https://borncity.com/win/feed/", "⚡ Breaking IT & Zero-Day Report", 0x3498DB, "incidents", True),
         ("Krebs on Security", "https://krebsonsecurity.com/feed/", "📰 Cybercrime Investigation", 0x2ECC71, "incidents", False),
-        ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C, "malware", False),
+        ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C, "research", False),
         ("SANS ISC", "https://isc.sans.edu/rssfeed.xml", "⚡ Global Threat Storm Briefing", 0x3498DB, "incidents", False),
         ("Exploit-DB", "https://www.exploit-db.com/rss.xml", "💥 Exploit PoC Alert", 0xE91E63, "vulnerabilities", False),
         ("Packet Storm", "https://packetstorm.news/rss/files", "💥 Exploit PoC Alert", 0xE91E63, "vulnerabilities", False),
