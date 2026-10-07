@@ -3,6 +3,7 @@ import re
 import csv
 import io
 import html
+import json
 import time
 import base64
 import socket
@@ -26,6 +27,8 @@ WEBHOOK_CHANNELS = {
     "vulnerabilities": os.getenv("DISCORD_WEBHOOK_VULNERABILITIES"),
     "gov_advisory": os.getenv("DISCORD_WEBHOOK_GOV_ADVISORY"),
     "incidents": os.getenv("DISCORD_WEBHOOK_INCIDENTS"),
+    "podcasts": os.getenv("DISCORD_WEBHOOK_PODCASTS"),
+    "research": os.getenv("DISCORD_WEBHOOK_RESEARCH"),
 }
 
 TRIAGE_LAB_HOST = os.getenv("TRIAGE_LAB_HOST", "http://127.0.0.1:9999")
@@ -219,12 +222,12 @@ def classify_research_post(title: str, default_desc: str) -> tuple:
 
 async def resolve_host_metadata(session: aiohttp.ClientSession, raw_url: str) -> dict:
     try:
-        domain = urllib.parse.urlparse(raw_url).netloc.split(":")[0]
+        domain = urllib.parse.urlparse(raw_url).hostname or ""
         if not domain or not is_safe_target(domain):
             return {"ip": "Unresolved", "org": "Unknown Host", "country": "N/A"}
         
         loop = asyncio.get_running_loop()
-        addr_info = await loop.run_in_executor(None, socket.getaddrinfo, domain, None)
+        addr_info = await asyncio.to_thread(socket.getaddrinfo, domain, None)
         ip = addr_info[0][4][0]
         
         async with session.get(f"http://ip-api.com/json/{ip}?fields=status,country,isp,org,as", timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -245,12 +248,12 @@ async def enrich_dropper_infrastructure(session: aiohttp.ClientSession, raw_url:
         "strains": []
     }
     try:
-        host = urllib.parse.urlparse(raw_url).netloc.split(":")[0]
+        host = urllib.parse.urlparse(raw_url).hostname or ""
         if not host or not is_safe_target(host):
             return info
             
         loop = asyncio.get_running_loop()
-        addr_info = await loop.run_in_executor(None, socket.getaddrinfo, host, None)
+        addr_info = await asyncio.to_thread(socket.getaddrinfo, host, None)
         ip = addr_info[0][4][0]
         info["ip"] = ip
         
@@ -315,7 +318,7 @@ def detect_target_campaign(url: str) -> str:
 
 async def check_payload_liveness(session: aiohttp.ClientSession, url: str) -> str:
     try:
-        domain = urllib.parse.urlparse(url).netloc.split(":")[0]
+        domain = urllib.parse.urlparse(url).hostname or ""
         if not is_safe_target(domain):
             return "🔴 Untrusted Target Host"
         real_url = url.replace("hxxp", "http").replace("[.]", ".")
@@ -362,6 +365,36 @@ def extract_malware_family(raw_tags: str) -> str:
 
 # --- STRICT DISCORD EMBED ROUTER ---
 
+async def is_first_run() -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM seen_events") as cursor:
+            row = await cursor.fetchone()
+            return not row or row[0] == 0
+
+
+def clamp_discord_embed(embed: dict) -> dict:
+    embed["title"] = (embed.get("title") or "")[:256]
+    embed["description"] = (embed.get("description") or "")[:2000]
+
+    fields = embed.get("fields") or []
+    limited_fields = []
+    total_length = len(embed["title"]) + len(embed["description"])
+    footer_text = embed.get("footer", {}).get("text", "")
+    total_length += len(footer_text)
+
+    for field in fields[:25]:
+        name = (field.get("name") or "Field")[:256]
+        value = (field.get("value") or "Not provided")[:1024]
+        remaining = 6000 - total_length - len(name) - len(value)
+        if remaining < 0:
+            break
+        limited_fields.append({"name": name, "value": value, "inline": bool(field.get("inline"))})
+        total_length += len(name) + len(value)
+
+    embed["fields"] = limited_fields
+    return embed
+
+
 async def dispatch_discord_embed(
     session: aiohttp.ClientSession,
     channel_key: str,
@@ -371,178 +404,297 @@ async def dispatch_discord_embed(
     color: int,
     image_url: str = None,
     mitre_tactics: str = None
-):
+) -> bool:
     target_webhook = WEBHOOK_CHANNELS.get(channel_key)
-    if not target_webhook or "discord.com" not in target_webhook:
-        return
-    
+
+    if not target_webhook:
+        print(f"[Discord Error] {channel_key}: no webhook configured")
+        return False
+
+    if not target_webhook.startswith(("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/")):
+        print(f"[Discord Error] {channel_key}: invalid webhook URL")
+        return False
+
     footer_text = "Homunculus CTI Core • Automated Threat Stream"
     if mitre_tactics:
         footer_text = f"ATT&CK: {mitre_tactics} • {footer_text}"
-        
+
     embed = {
-        "title": title[:256],
-        "description": description[:2000],
+        "title": title,
+        "description": description,
         "color": color,
         "fields": fields,
         "footer": {"text": footer_text}
     }
+
     if image_url and image_url.startswith("http"):
         embed["image"] = {"url": image_url}
 
+    embed = clamp_discord_embed(embed)
     payload = {"embeds": [embed]}
-    for attempt in range(3):
+
+    for attempt in range(4):
         try:
-            async with session.post(target_webhook, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 429:
-                    retry_data = await resp.json()
-                    wait_time = float(retry_data.get("retry_after", 1.5))
-                    await asyncio.sleep(wait_time)
+            async with session.post(
+                target_webhook,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as response:
+                if response.status in (200, 204):
+                    return True
+
+                if response.status == 429:
+                    retry_after = 1.5
+                    try:
+                        retry_data = await response.json()
+                        retry_after = float(retry_data.get("retry_after", 1.5))
+                    except Exception:
+                        pass
+                    await asyncio.sleep(retry_after + 0.25)
                     continue
-                elif resp.status in (200, 204):
-                    break
-        except Exception:
-            await asyncio.sleep(1)
+
+                response_body = await response.text()
+                print(f"[Discord Error] {channel_key}: HTTP {response.status}: {response_body[:500]}")
+
+                if response.status in (500, 502, 503, 504):
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+                return False
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            print(f"[Discord Error] {channel_key}: {error}")
+            await asyncio.sleep(2 ** attempt)
+
+    return False
+
+
 
 # --- COLLECTOR TASKS ---
 
 async def poll_leak_trackers(session: aiohttp.ClientSession):
-    # 1. Ransomware.live Real-Time XML Stream
-    try:
-        async with session.get("https://ransomware.live/rss.xml", headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 200:
-                feed = feedparser.parse(await resp.text())
-                for entry in feed.entries[:25]:
-                    link = entry.get("link", "")
-                    title = entry.get("title", "")
-                    raw_id = entry.get("id") or link or title
-                    event_id = get_stable_id("rwlive", raw_id)
+    bootstrap_limit = 2 if await is_first_run() else None
 
-                    if not await is_duplicate(event_id):
+    # 1. Ransomware.live victim RSS feed
+    try:
+        async with session.get(
+            "https://ransomware.live/rss.xml",
+            headers=BROWSER_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            if response.status == 200:
+                feed = feedparser.parse(await response.text())
+                entries = feed.entries[:bootstrap_limit] if bootstrap_limit else feed.entries[:25]
+
+                for entry in entries:
+                    entry_link = entry.get("link", "")
+                    title = entry.get("title", "Unidentified ransomware victim")
+
+                    if "claimed by" in title.lower():
+                        victim_part, group_part = re.split(
+                            r"claimed by", title, flags=re.IGNORECASE, maxsplit=1
+                        )
+                        victim = victim_part.strip(" -—") or title
+                        group = group_part.strip() or "Unattributed"
+                    else:
+                        victim = title
+                        group = "Unattributed"
+
+                    event_id = normalize_leak_event_id(group, victim)
+
+                    if await is_duplicate(event_id):
+                        continue
+
+                    raw_note = entry.get("summary", "") or entry.get("description", "")
+                    clean_note = clean_html_to_markdown(raw_note)[:450]
+                    translated_note, was_translated = await auto_translate_to_english(session, clean_note)
+
+                    actor_name = group
+                    actor_dossier = get_threat_actor_dossier_links(actor_name)
+
+                    fields = [
+                        {
+                            "name": "Threat Actor Dossier",
+                            "value": actor_dossier,
+                            "inline": False,
+                        },
+                        {
+                            "name": "Discovery Link",
+                            "value": f"[Inspect Leak Page]({entry_link})" if entry_link else "Not provided",
+                            "inline": False,
+                        },
+                    ]
+
+                    prefix = "🚨 Ransomware Alert [Translated]:" if was_translated else "🚨 Ransomware Alert:"
+                    description = translated_note or clean_note or "New victim published on an extortion leak site."
+
+                    dispatched = await dispatch_discord_embed(
+                        session=session,
+                        channel_key="ransomware",
+                        title=f"{prefix} {title[:180]}",
+                        description=f"**Extortion Notice / Group Claim:**\n>>> {description}",
+                        fields=fields,
+                        color=0xE74C3C,
+                        mitre_tactics="T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service",
+                    )
+
+                    if dispatched:
                         await record_event(event_id, "Ransomware.live")
-                        clean_desc = clean_html_to_markdown(entry.get("summary", "") or entry.get("description", ""))
-                        trans_desc, was_trans = await auto_translate_to_english(session, clean_desc[:450])
-                        
-                        group_name = "Ransomware Group"
-                        if " - " in title:
-                            group_name = title.split(" - ")[0].strip()
-                        elif " claimed by " in title.lower():
-                            parts = re.split(r" claimed by ", title, flags=re.IGNORECASE)
-                            group_name = parts[-1].strip()
+            else:
+                print(f"[Collector Error] Ransomware.live RSS: HTTP {response.status}")
 
-                        actor_dossier = get_threat_actor_dossier_links(group_name)
-                        fields = [
-                            {"name": "Threat Actor Dossier", "value": actor_dossier, "inline": False},
-                            {"name": "Discovery Link", "value": f"[Inspect Leak Page]({link})", "inline": False}
-                            ("Have I Been Pwned", "https://haveibeenpwned.com/feed/breaches/", "🚨 Data Breach Notification", 0xE74C3C, "ransomware", False),
-        ("DataBreaches.net", "https://www.databreaches.net/feed/", "🚨 Leak Site Incident", 0xE74C3C, "ransomware", False),
-        ("Google TAG", "https://blog.google/threat-analysis-group/rss/", "🔬 Nation-State APT Report", 0x1ABC9C, "research", False),
-        ("SentinelLabs", "https://www.sentinelone.com/labs/feed/", "🔬 In-Depth Malware Analysis", 0x1ABC9C, "research", False),
-        ("Red Canary Intel", "https://redcanary.com/blog/threat-intelligence/feed/", "🔬 Adversary Tradecraft", 0x1ABC9C, "research", False),
-        ("Zero Day Initiative", "https://www.zerodayinitiative.com/blog?format=rss", "💥 Vulnerability & PoC Advisory", 0xE67E22, "vulnerabilities", False),
-        ("Cybersecurity Headlines", "https://cisoseries.libsyn.com/rss", "🎙 Daily Audio Briefing", 0x3498DB, "podcasts", False),
-        ("SANS Stormcast", "https://isc.sans.edu/podcast.rss", "🎙 Daily Audio Briefing", 0x3498DB, "podcasts", False),
-        ("Risky Business", "https://risky.biz/feeds/risky-business", "🎙 Industry Podcast", 0x3498DB, "podcasts", False),
-        ("Darknet Diaries", "https://podcast.darknetdiaries.com/", "🎧 Darknet Stories", 0x9B59B6, "podcasts", False),
-        ("Smashing Security", "https://www.smashingsecurity.com/rss", "🎙 Security & Tech Podcast", 0x3498DB, "podcasts", False),
-        ("ShadowTalk", "https://shadowtalk.libsyn.com/rss", "🎙 Threat Intel Podcast", 0x3498DB, "podcasts", False),
-        ("Hacker and the Fed", "https://feeds.megaphone.fm/hackerandthefed", "🎙 Security Case Studies", 0x3498DB, "podcasts", False),
-        ("Defensive Security", "https://defensivesecurity.org/feed/podcast", "🎙 Blue Team Analysis", 0x3498DB, "podcasts", False),
-        ("CISO Series Podcast", "https://cisoseries.com/feed/podcast/", "🎙 Security Leadership", 0x3498DB, "podcasts", False),
-        ("2.5 Admins", "https://2.5admins.com/feed/podcast", "🎙 Sysadmin & Ops Discussion", 0x3498DB, "podcasts", False),
-        ("Cloud Security Podcast", "https://feeds.buzzsprout.com/743477.rss", "🎙 Cloud Architecture & IAM", 0x3498DB, "podcasts", False),
-        ("AI Security Podcast", "https://feeds.buzzsprout.com/2242131.rss", "🎙 AI Safety & LLM Red Teaming", 0x3498DB, "podcasts", False),
-        ("Cybersecurity Defenders", "https://feeds.buzzsprout.com/2095909.rss", "🎙 Detection & SOC Triage", 0x3498DB, "podcasts", False),
-        ("Adversary Universe", "https://feeds.buzzsprout.com/1826048.rss", "🎙 Threat Actor Profiling", 0x3498DB, "podcasts", False),
-        ("Cyber Threat Perspective", "https://anchor.fm/s/5713437c/podcast/rss", "🎙 Adversary Hunting", 0x3498DB, "podcasts", False),
-        ("What the Hack", "https://feeds.megaphone.fm/whatthehack", "🎙 Scam & Fraud Breakdown", 0x3498DB, "podcasts", False),
-        ("Hacked", "https://feeds.megaphone.fm/hacked", "🎙 Cybercrime Narrative", 0x3498DB, "podcasts", False),
-        ("Error Code", "https://errorcode.libsyn.com/rss", "🎙 IoT & Embedded Security", 0x3498DB, "podcasts", False),
-        ("Dev Interrupted", "https://feeds.buzzsprout.com/1126172.rss", "🎙 DevSecOps & Architecture", 0x3498DB, "podcasts", False),
-        ("Cyber Uncut", "https://www.defenceconnect.com.au/rss/podcasts/cyber-uncut", "🎙 National Cyber Policy", 0x3498DB, "podcasts", False),
-        ("SANS Stormcast", "https://isc.sans.edu/podcast.rss", "🎙 Daily Audio Briefing", 0x3498DB, "podcasts", False),
-        ("CyberWire Daily", "https://feeds.megaphone.fm/cyberwire-daily-podcast", "🎙 Daily Audio Briefing", 0x3498DB, "podcasts", False),
-        ("Hacking Humans", "https://feeds.megaphone.fm/CSN1771344706", "🎙 Social Engineering & Scams", 0x9B59B6, "podcasts", False),
-        ("Late Night Linux", "https://latenightlinux.com/feeds/latenightlinux.xml", "🎙 Linux & Systems Ops", 0x2ECC71, "podcasts", False),
-        ("Daily Cyber Threat Brief", "https://feeds.transistor.fm/daily-cyber-threat-brief", "🎙 Threat Briefing", 0x3498DB, "podcasts", False),
-        ("Cybersecurity Today", "https://cybersecuritytoday.libsyn.com/rss", "🎙 Daily Infosec News", 0x3498DB, "podcasts", False),
-        ("Microsoft Threat Intel", "https://feeds.megaphone.fm/CSN8334463375", "🎙 Microsoft Research", 0x00A4EF, "podcasts", False),
-        ("Secure AF", "https://feeds.buzzsprout.com/660007.rss", "🎙 Tactical Red/Blue Team", 0xE67E22, "podcasts", False),
-        ("WIRED Security", "https://www.wired.com/feed/category/security/latest/rss", "📰 Investigative Journalism", 0xE91E63, "podcasts", False),
-    ]
+    except Exception as error:
+        print(f"[Collector Error] Ransomware.live RSS: {error}")
 
-                        prefix = "🚨 Ransomware Alert [Translated]:" if was_trans else "🚨 Ransomware Alert:"
-                        await dispatch_discord_embed(
-                            session=session,
-                            channel_key="ransomware",
-                            title=f"{prefix} {title[:100]}",
-                            description=f"**Extortion Notice / Group Claim:**\n>>> {trans_desc or clean_desc or 'New victim published on extortion leak site.'}",
-                            fields=fields,
-                            color=0xE74C3C,
-                            mitre_tactics="T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service"
-                        )
-    except Exception as e:
-        print(f"[Collector Error] Ransomware.live RSS: {e}")
-
-    # 2. RansomLook API
+    # 2. RansomLook victim API
     try:
-        async with session.get("https://www.ransomlook.io/api/posts?days=1", headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-            if resp.status == 200:
-                for post in (await resp.json())[:20]:
-                    victim = post.get("post_title", "Unknown")
-                    group = post.get("group_name", "Unknown")
-                    raw_id = f"{group}_{victim}_{post.get('discovered', '')}"
-                    event_id = get_stable_id("rlook", raw_id)
+        async with session.get(
+            "https://www.ransomlook.io/api/posts?days=1",
+            headers=BROWSER_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            if response.status == 200:
+                payload = await response.json(content_type=None)
 
-                    if not await is_duplicate(event_id):
+                if isinstance(payload, list):
+                    posts = payload
+                elif isinstance(payload, dict):
+                    posts = payload.get("data") or payload.get("posts") or payload.get("results") or []
+                else:
+                    posts = []
+
+                if bootstrap_limit:
+                    posts = posts[:bootstrap_limit]
+                else:
+                    posts = posts[:20]
+
+                for post in posts:
+                    if not isinstance(post, dict):
+                        continue
+
+                    victim = post.get("post_title") or post.get("victim") or "Unknown victim"
+                    group = post.get("group_name") or post.get("group") or "Unattributed"
+                    event_id = normalize_leak_event_id(group, victim)
+
+                    if await is_duplicate(event_id):
+                        continue
+
+                    raw_note = post.get("description") or ""
+                    clean_note = clean_html_to_markdown(raw_note)[:450]
+                    translated_note, was_translated = await auto_translate_to_english(session, clean_note)
+                    actor_dossier = get_threat_actor_dossier_links(group)
+
+                    prefix = "🚨 Ransomware Alert [Translated]:" if was_translated else "🚨 Ransomware Alert:"
+
+                    dispatched = await dispatch_discord_embed(
+                        session=session,
+                        channel_key="ransomware",
+                        title=f"{prefix} {victim}",
+                        description=(f"**Extortion Claim:**\n>>> {translated_note or clean_note}" if (translated_note or clean_note) else "Listed on a ransomware leak site. The source supplied no claim text."),
+                        fields=[
+                            {
+                                "name": "Threat Actor Dossier",
+                                "value": actor_dossier,
+                                "inline": False,
+                            },
+                            {
+                                "name": "Source",
+                                "value": "RansomLook API",
+                                "inline": True,
+                            },
+                        ],
+                        color=0xE74C3C,
+                        mitre_tactics="T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service",
+                    )
+
+                    if dispatched:
                         await record_event(event_id, "RansomLook")
-                        desc = post.get("description") or "Target listed on double-extortion leak directory."
-                        clean_desc = clean_html_to_markdown(desc)[:350]
-                        trans_desc, was_trans = await auto_translate_to_english(session, clean_desc)
-                        actor_dossier = get_threat_actor_dossier_links(group)
-                        prefix = "🚨 Ransomware Alert [Translated]:" if was_trans else "🚨 Ransomware Alert:"
-                        await dispatch_discord_embed(
-                            session=session,
-                            channel_key="ransomware",
-                            title=f"{prefix} {victim}",
-                            description=f"**Extortion Claim:**\n>>> {trans_desc}",
-                            fields=[
-                                {"name": "Threat Actor Dossier", "value": actor_dossier, "inline": False},
-                                {"name": "Source", "value": "RansomLook API", "inline": True}
-                            ],
-                            color=0xE74C3C,
-                            mitre_tactics="T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service"
-                        )
-    except Exception as e:
-        print(f"[Collector Error] RansomLook: {e}")
+            else:
+                print(f"[Collector Error] RansomLook: HTTP {response.status}")
 
-    # 3. Ransomwatch Git Data
+    except Exception as error:
+        print(f"[Collector Error] RansomLook: {error}")
+
+    # 3. Ransomwatch public JSON archive
     try:
-        async with session.get("https://raw.githubusercontent.com/joshhighet/ransomwatch/main/posts.json", timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 200:
-                for post in (await resp.json())[-20:]:
-                    victim = post.get("post_title", "Unknown")
-                    group = post.get("group_name", "Unknown")
-                    raw_id = f"{group}_{victim}_{post.get('discovered', '')}"
-                    event_id = get_stable_id("rwatch", raw_id)
+        async with session.get(
+            "https://raw.githubusercontent.com/joshhighet/ransomwatch/main/posts.json",
+            headers={
+                **BROWSER_HEADERS,
+                "Accept": "application/json",
+            },
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as response:
+            if response.status != 200:
+                print(f"[Collector Error] Ransomwatch: HTTP {response.status}")
+                return
 
-                    if not await is_duplicate(event_id):
-                        await record_event(event_id, "Ransomwatch")
-                        actor_dossier = get_threat_actor_dossier_links(group)
-                        await dispatch_discord_embed(
-                            session=session,
-                            channel_key="ransomware",
-                            title=f"🚨 Ransomware Alert: {victim}",
-                            description=f"Automated crawler detected fresh victim published on **{group}**'s leak site.",
-                            fields=[
-                                {"name": "Threat Actor Dossier", "value": actor_dossier, "inline": False},
-                                {"name": "Source", "value": "Ransomwatch Git Data", "inline": True}
-                            ],
-                            color=0xE74C3C,
-                            mitre_tactics="T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service"
-                        )
-    except Exception as e:
-        print(f"[Collector Error] Ransomwatch: {e}")
+            content_type = response.headers.get("Content-Type", "")
+            raw_body = await response.text()
+
+            if "json" not in content_type.lower() and not raw_body.lstrip().startswith(("[", "{")):
+                print(f"[Collector Error] Ransomwatch: unexpected content type {content_type}")
+                return
+
+            try:
+                payload = json.loads(raw_body)
+            except Exception as error:
+                print(f"[Collector Error] Ransomwatch JSON parsing: {error}")
+                return
+
+            if isinstance(payload, list):
+                posts = payload
+            elif isinstance(payload, dict):
+                posts = payload.get("data") or payload.get("posts") or []
+            else:
+                posts = []
+
+            if bootstrap_limit:
+                posts = posts[:bootstrap_limit]
+            else:
+                posts = posts[-20:]
+
+            for post in posts:
+                if not isinstance(post, dict):
+                    continue
+
+                victim = post.get("post_title") or post.get("victim") or "Unknown victim"
+                group = post.get("group_name") or post.get("group") or "Unattributed"
+                event_id = normalize_leak_event_id(group, victim)
+
+                if await is_duplicate(event_id):
+                    continue
+
+                actor_dossier = get_threat_actor_dossier_links(group)
+
+                dispatched = await dispatch_discord_embed(
+                    session=session,
+                    channel_key="ransomware",
+                    title=f"🚨 Ransomware Alert: {victim}",
+                    description=f"Automated crawler detected a victim claim associated with **{group}**.",
+                    fields=[
+                        {
+                            "name": "Threat Actor Dossier",
+                            "value": actor_dossier,
+                            "inline": False,
+                        },
+                        {
+                            "name": "Source",
+                            "value": "Ransomwatch Public Archive",
+                            "inline": True,
+                        },
+                    ],
+                    color=0xE74C3C,
+                    mitre_tactics="T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service",
+                )
+
+                if dispatched:
+                    await record_event(event_id, "Ransomwatch")
+
+    except Exception as error:
+        print(f"[Collector Error] Ransomwatch: {error}")
+
+
 
 async def poll_infrastructure(session: aiohttp.ClientSession):
     # Patched Feodo Tracker endpoint
@@ -629,7 +781,8 @@ async def poll_infrastructure(session: aiohttp.ClientSession):
                                     "inline": False
                                 })
                                 
-                            liveness = await check_payload_liveness(session, raw_url)
+                            urlhaus_status = row[3].strip() if len(row) > 3 else "unknown"
+                            liveness = f"URLhaus reports: {urlhaus_status}"
                             fields.extend([
                                 {"name": "Host Status", "value": f"**{liveness}**", "inline": True},
                                 {"name": "Campaign Tags", "value": f"`{tags or 'None'}`", "inline": True},
@@ -698,6 +851,47 @@ async def poll_infrastructure(session: aiohttp.ClientSession):
     except Exception as e:
         print(f"[Collector Error] OpenPhish: {e}")
 
+async def check_c2_dns(ioc_value, ioc_type) -> str:
+    try:
+        value = (ioc_value or "").strip()
+        kind = (ioc_type or "").lower()
+        if kind == "url":
+            host = urllib.parse.urlparse(value).hostname or ""
+        elif kind == "ip:port":
+            host = value.rsplit(":", 1)[0].strip("[]")
+        elif kind == "domain":
+            host = value
+        else:
+            return "⚪ Not applicable"
+        if not host:
+            return "⚪ Not applicable"
+        try:
+            ipaddress.ip_address(host)
+            return "⚪ Direct IP (no DNS lookup)"
+        except ValueError:
+            pass
+        info = await asyncio.wait_for(asyncio.to_thread(socket.getaddrinfo, host, None), timeout=5)
+        ips = sorted({r[4][0] for r in info})
+        if not ips:
+            return "🔴 Does not resolve"
+        public = []
+        for ip in ips:
+            obj = ipaddress.ip_address(ip.split("%")[0])
+            if not (obj.is_private or obj.is_loopback or obj.is_unspecified or obj.is_reserved or obj.is_link_local):
+                public.append(ip)
+        if not public:
+            return "🟠 Resolves to non-public IP only"
+        return "🟢 Live DNS (" + ", ".join(public[:2]) + ")"
+    except asyncio.TimeoutError:
+        return "🟡 DNS check timed out"
+    except socket.gaierror as err:
+        missing = {socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)}
+        if err.errno in missing:
+            return "🔴 Does not resolve"
+        return "🟡 DNS check failed"
+    except Exception:
+        return "🟡 DNS check failed"
+
 async def poll_threatfox(session: aiohttp.ClientSession):
     if not ABUSECH_AUTH_KEY:
         return
@@ -724,10 +918,12 @@ async def poll_threatfox(session: aiohttp.ClientSession):
                             defanged = defang_url(ioc_val)[:120]
                             tf_url = f"https://threatfox.abuse.ch/ioc/{ioc_id}/"
                             
+                            dns_status = await check_c2_dns(ioc_val, item.get("ioc_type"))
                             fields = [
                                 {"name": "Malware / Campaign", "value": f"**{malware}**", "inline": True},
-                                {"name": "Activity Type", "value": f"`{threat_type}`", "inline": True},
+                                {"name": "Indicator Type", "value": f"`{item.get('ioc_type') or 'unknown'}`", "inline": True},
                                 {"name": "Confidence Score", "value": f"`{confidence}%`", "inline": True},
+                                {"name": "DNS Status", "value": f"**{dns_status}**", "inline": True},
                                 {"name": "Campaign Tags", "value": f"`{tags_str or 'None'}`", "inline": False},
                                 {"name": "Defanged Indicator", "value": f"`{defanged}`", "inline": False},
                                 {"name": "Threat Database", "value": f"[View ThreatFox Dossier]({tf_url})", "inline": False}
@@ -809,52 +1005,97 @@ async def poll_vulnerabilities(session: aiohttp.ClientSession):
 
 
 def condense_podcast_summary(raw_html: str, max_points: int = 10) -> str:
-    """Extracts up to 10 clean, sponsor-free bullet takeaways from show notes."""
+    """Extract up to ten concise, sponsor-filtered takeaways from podcast notes."""
     if not raw_html:
         return "Episode published with no detailed show notes."
-    
+
     text = clean_html_to_markdown(raw_html)
-    
-    # Strip sponsor messages, promo codes, and marketing boilerplate
+
     ad_patterns = [
-        r'(?i)thanks to our sponsor.*',
-        r'(?i)sponsored by.*',
-        r'(?i)check out our patreon.*',
-        r'(?i)support us on patreon.*',
-        r'(?i)use promo code.*',
-        r'(?i)visit https?://[^\s]+ for \d+% off.*',
-        r'(?i)music by.*'
+        r"(?i)thanks to our sponsor.*",
+        r"(?i)sponsored by.*",
+        r"(?i)check out our patreon.*",
+        r"(?i)support us on patreon.*",
+        r"(?i)use promo code.*",
+        r"(?i)visit https?://[^\s]+ for \d+% off.*",
+        r"(?i)music by.*",
     ]
-    for pat in ad_patterns:
-        text = re.sub(pat, '', text)
-    
-    # Split by line breaks or sentences
-    lines = [l.strip(" -•*") for l in re.split(r'[
+    for pattern in ad_patterns:
+        text = re.sub(pattern, "", text)
 
-]+|\.\s+', text) if len(l.strip()) > 20]
-    
-    key_points = lines[:max_points]
-    if not key_points:
-        return text[:400] + "..." if len(text) > 400 else text
+    candidates = []
+    for line in text.splitlines():
+        line = line.strip(" -•*\t")
+        if len(line) >= 20:
+            candidates.append(line)
 
-    return "\n".join([f"• {point.strip('.')}" for point in key_points])
+    if len(candidates) < max_points:
+        candidates = [
+            sentence.strip(" -•*\t.")
+            for sentence in re.split(r"(?<=[.!?])\s+", text)
+            if len(sentence.strip()) >= 20
+        ]
+
+    points = candidates[:max_points]
+
+    if not points:
+        return text[:400] + ("..." if len(text) > 400 else "")
+
+    return "\n".join(f"• {point}" for point in points)
+
+from rss_topic import classify_rss_topic
+
+from advisory_title import tidy_advisory_title
+
+# --- Host Status indicator (red = offline, green = online) ---
+import functools as _functools
+
+def _status_dot(value):
+    low = str(value).lower()
+    if "offline" in low:
+        return "🔴 "
+    if "online" in low:
+        return "🟢 "
+    return ""
+
+def _with_status_dots(fn):
+    @_functools.wraps(fn)
+    async def inner(*args, **kwargs):
+        fields = kwargs.get("fields")
+        if fields:
+            new_fields = []
+            for f in fields:
+                if isinstance(f, dict) and "host status" in str(f.get("name", "")).lower():
+                    val = str(f.get("value", ""))
+                    if not val.startswith(("🔴", "🟢")):
+                        f = {**f, "value": _status_dot(val) + val}
+                new_fields.append(f)
+            kwargs["fields"] = new_fields
+        return await fn(*args, **kwargs)
+    return inner
+
+dispatch_discord_embed = _with_status_dots(dispatch_discord_embed)
+
 
 async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, feed_url: str, alert_type: str, color: int, channel_key: str, may_need_translation: bool = False):
     async with CONCURRENCY_SEMAPHORE:
         try:
             async with session.get(feed_url, headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                 if resp.status != 200:
+                    print(f"[RSS Error] {publisher}: HTTP {resp.status}")
                     return
                 xml_data = await resp.text()
 
             feed = feedparser.parse(xml_data)
-            for entry in feed.entries[:6]:
+            bootstrap_limit = 2 if await is_first_run() else None
+            entries = feed.entries[:bootstrap_limit] if bootstrap_limit else feed.entries[:6]
+
+            for entry in entries:
                 entry_link = entry.get("link", "")
                 raw_id = entry.get("id") or entry_link
                 event_id = f"tc_{raw_id}" if publisher == "ThreatCluster" else get_stable_id("rss", raw_id)
 
                 if not await is_duplicate(event_id):
-                    await record_event(event_id, publisher)
                     raw_title = entry.get("title", "Untitled feed entry")
                     raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
                     if channel_key == "podcasts" or "🎙" in alert_type or "🎧" in alert_type:
@@ -874,6 +1115,18 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
                         final_desc = clean_text
                         display_title = f"{alert_type}: {raw_title}"
 
+                    if channel_key == "gov_advisory":
+                        _head, _sep, _rest = display_title.partition(": ")
+                        if _sep:
+                            _clean, _sev, _upd = tidy_advisory_title(_rest)
+                            _head = _head.replace(" [Translated]", "")
+                            if _sev:
+                                _head += f" · {_sev[0]} {_sev[1]}"
+                            if _upd:
+                                _head += " · 🔄 Updated"
+                            _wid = re.search(r"name=(WID-SEC-\d{4}-\d+)", entry_link or "")
+                            display_title = f"{_head}: {_clean}" + (f" ({_wid.group(1)})" if _wid else "")
+                    
                     if publisher == "Malware Traffic Analysis":
                         platform, threat_cat, final_desc = classify_research_post(display_title, final_desc)
                         fields = [
@@ -981,9 +1234,13 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
                                     "inline": False
                                 })
 
-                        alert_mitre = "T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service" if publisher == "ThreatCluster" else ("T1592 Gather Victim Host Info • T1595 Active Scanning" if "Advisory" in alert_type else "T1588 Obtain Capabilities")
+                        if channel_key == "research":
+                            _topic_label, alert_mitre = classify_rss_topic(raw_title, final_desc)
+                            display_title = display_title.replace(alert_type, _topic_label, 1)
+                        else:
+                            alert_mitre = "T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service" if publisher == "ThreatCluster" else ("T1592 Gather Victim Host Info • T1595 Active Scanning" if "Advisory" in alert_type else "T1588 Obtain Capabilities")
 
-                    await dispatch_discord_embed(
+                    dispatched = await dispatch_discord_embed(
                         session=session,
                         channel_key=channel_key,
                         title=display_title,
@@ -992,21 +1249,26 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
                         color=color,
                         mitre_tactics=alert_mitre
                     )
-        except Exception:
-            pass
+
+                    if dispatched:
+                        await record_event(event_id, publisher)
+
+        except Exception as error:
+            print(f"[RSS Error] {publisher}: {error}")
+
+
 
 async def poll_rss_streams(session: aiohttp.ClientSession):
     # Patched and updated RSS catalog
     rss_catalog = [
         ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/report-rss-feed.xml", "🛡 Government Advisory", 0x2980B9, "gov_advisory", False),
         ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "🛡 Government Advisory", 0x2980B9, "gov_advisory", False),
-        ("CISA ICS", "https://www.securityweek.com/feed/", "🏭 Industrial Control Systems Alert", 0xD35400, "gov_advisory", False),
+        ("CISA ICS Advisories", "https://www.cisa.gov/cybersecurity-advisories/ics-advisories.xml", "🏭 Industrial Control Systems Alert", 0xD35400, "gov_advisory", False),
         ("CERT-FR", "https://www.cert.ssi.gouv.fr/feed/", "🛡 Government Advisory", 0x2980B9, "gov_advisory", True),
         ("CERT-Bund (BSI)", "https://wid.cert-bund.de/content/public/securityAdvisory/rss", "🛡 Government Advisory", 0x2980B9, "gov_advisory", True),
-        ("Canadian Cyber", "https://www.cyber.gc.ca/api/v1/feed/cyber-advisories/en", "🛡 Government Advisory", 0x2980B9, "gov_advisory", False),
+        ("Canadian Cyber", "https://www.cyber.gc.ca/api/cccs/rss/v1/get?feed=alerts_advisories&lang=en", "🛡 Government Advisory", 0x2980B9, "gov_advisory", False),
         ("Malware Traffic Analysis", "https://www.malware-traffic-analysis.net/blog-entries.rss", "🔬 PCAP & Infection Chain", 0x1ABC9C, "research", False),
-        ("vx-underground", "https://vx-underground.org/rss/papers.xml", "🧬 Malware Research & Analysis", 0x8E44AD, "research", False),
-        ("nao_sec", "https://nao-sec.org/feed", "🔬 Independent Threat Hunting", 0x1ABC9C, "research", True),
+          ("nao_sec", "https://nao-sec.org/feed", "🔬 Independent Threat Hunting", 0x1ABC9C, "research", True),
         ("BornCity Security", "https://borncity.com/win/feed/", "⚡ Breaking IT & Zero-Day Report", 0x3498DB, "incidents", True),
         ("Krebs on Security", "https://krebsonsecurity.com/feed/", "📰 Cybercrime Investigation", 0x2ECC71, "incidents", False),
         ("Unit 42", "https://unit42.paloaltonetworks.com/feed/", "🔬 Threat Research & APTs", 0x1ABC9C, "research", False),
@@ -1016,25 +1278,64 @@ async def poll_rss_streams(session: aiohttp.ClientSession):
         ("ThreatCluster Vulns", "https://threatcluster.io/vulnerabilities/feed.xml", "🦠 Vulnerability Alert", 0xE67E22, "vulnerabilities", False),
         ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "📰 Cyber Incident Report", 0x2ECC71, "incidents", False),
         ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "📰 Cyber Incident Report", 0x2ECC71, "incidents", False),
-        ("ThreatCluster", "https://threatcluster.io/dark-web/feed.xml", "🚨 Dark Web Victim Stream", 0xE74C3C, "ransomware", True)
+        ("ThreatCluster", "https://threatcluster.io/dark-web/feed.xml", "🚨 Dark Web Victim Stream", 0xE74C3C, "ransomware", True),
+        ("Have I Been Pwned", "https://haveibeenpwned.com/feed/breaches/", "🚨 Data Breach Notification", 0xE74C3C, "ransomware", False),
+        ("DataBreaches.net", "https://www.databreaches.net/feed/", "🚨 Leak Site Incident", 0xE74C3C, "ransomware", False),
+        ("Google TAG", "https://cloud.google.com/blog/topics/threat-intelligence/rss/", "🔬 Nation-State APT Report", 0x1ABC9C, "research", False),
+        ("SentinelLabs", "https://www.sentinelone.com/labs/feed/", "🔬 Threat Research", 0x1ABC9C, "research", False),
+        ("Red Canary Intel", "https://redcanary.com/blog/feed/", "🔬 Adversary Tradecraft", 0x1ABC9C, "research", False),
+        ("Zero Day Initiative", "https://www.zerodayinitiative.com/blog?format=rss", "💥 Vulnerability & PoC Advisory", 0xE67E22, "vulnerabilities", False),
+        ("Cybersecurity Headlines", "https://cisoseries.libsyn.com/rss", "🎙 Daily Audio Briefing", 0x3498DB, "podcasts", False),
+        ("SANS Stormcast", "https://isc.sans.edu/podcast.rss", "🎙 Daily Audio Briefing", 0x3498DB, "podcasts", False),
+        ("Risky Business", "https://risky.biz/feeds/risky-business", "🎙 Industry Podcast", 0x3498DB, "podcasts", False),
+        ("Darknet Diaries", "https://feeds.megaphone.fm/darknetdiaries", "🎧 Darknet Stories", 0x9B59B6, "podcasts", False),
+        ("Smashing Security", "https://www.smashingsecurity.com/rss", "🎙 Security & Tech Podcast", 0x3498DB, "podcasts", False),
+        ("ShadowTalk", "https://rss.buzzsprout.com/2154459.rss", "🎙 Threat Intel Podcast", 0x3498DB, "podcasts", False),
+        ("Hacker and the Fed", "https://feeds.megaphone.fm/CON9079456418", "🎙 Security Case Studies", 0x3498DB, "podcasts", False),
+        ("Defensive Security", "https://defensivesecurity.org/feed/podcast", "🎙 Blue Team Analysis", 0x3498DB, "podcasts", False),
+        ("CISO Series Podcast", "https://cisoseries.com/feed/podcast/", "🎙 Security Leadership", 0x3498DB, "podcasts", False),
+        ("2.5 Admins", "https://2.5admins.com/feed/podcast", "🎙 Sysadmin & Ops Discussion", 0x3498DB, "podcasts", False),
+        ("Cloud Security Podcast", "https://anchor.fm/s/10fb9928/podcast/rss", "🎙 Cloud Architecture & IAM", 0x3498DB, "podcasts", False),
+        ("AI Security Podcast", "https://anchor.fm/s/eaa0671c/podcast/rss", "🎙 AI Safety & LLM Red Teaming", 0x3498DB, "podcasts", False),
+        ("Cybersecurity Defenders", "https://feeds.transistor.fm/the-cybersecurity-defenders-podcast", "🎙 Detection & SOC Triage", 0x3498DB, "podcasts", False),
+        ("Adversary Universe", "https://feeds.buzzsprout.com/1826048.rss", "🎙 Threat Actor Profiling", 0x3498DB, "podcasts", False),
+        ("Cyber Threat Perspective", "https://rss.buzzsprout.com/1731753.rss", "🎙 Adversary Hunting", 0x3498DB, "podcasts", False),
+        ("What the Hack", "https://rss.introcast.io/1571482669/feeds.megaphone.fm/TPG2245590306", "🎙 Scam & Fraud Breakdown", 0x3498DB, "podcasts", False),
+        ("Hacked", "https://feeds.megaphone.fm/hackedpodcast", "🎙 Cybercrime Narrative", 0x3498DB, "podcasts", False),
+        ("Error Code", "https://feed.podbean.com/errorcode/feed.xml", "🎙 IoT & Embedded Security", 0x3498DB, "podcasts", False),
+        ("Dev Interrupted", "https://rss.buzzsprout.com/1422892.rss", "🎙 DevSecOps & Architecture", 0x3498DB, "podcasts", False),
+        ("Cyber Uncut", "https://cybersecurityuncut.libsyn.com/rss", "🎙 National Cyber Policy", 0x3498DB, "podcasts", False),
+        ("CyberWire Daily", "https://feeds.megaphone.fm/cyberwire-daily-podcast", "🎙 Daily Audio Briefing", 0x3498DB, "podcasts", False),
+        ("Hacking Humans", "https://rss.pdrl.fm/7d51b0/feeds.megaphone.fm/hacking-humans", "🎙 Social Engineering & Scams", 0x9B59B6, "podcasts", False),
+        ("Late Night Linux", "https://latenightlinux.com/feed/mp3", "🎙 Linux & Systems Ops", 0x2ECC71, "podcasts", False),
+        ("Daily Cyber Threat Brief", "https://feeds.transistor.fm/simply-cyber", "🎙 Threat Briefing", 0x3498DB, "podcasts", False),
+        ("Cybersecurity Today", "https://cybersecuritytoday.libsyn.com/rss", "🎙 Daily Infosec News", 0x3498DB, "podcasts", False),
+        ("Microsoft Threat Intel", "https://feeds.megaphone.fm/microsoft-threat-intelligence", "🎙 Microsoft Research", 0x00A4EF, "podcasts", False),
+        ("Secure AF", "https://feeds.buzzsprout.com/660007.rss", "🎙 Tactical Red/Blue Team", 0xE67E22, "podcasts", False),
+        ("WIRED Security", "https://www.wired.com/feed/category/security/latest/rss", "📰 Investigative Journalism", 0xE91E63, "podcasts", False),
     ]
     
     rss_tasks = [
         fetch_and_process_rss(session, pub, url, a_type, color, ch_key, trans_flag)
         for pub, url, a_type, color, ch_key, trans_flag in rss_catalog
     ]
-    await asyncio.gather(*rss_tasks, return_exceptions=True)
+    _rss_results = await asyncio.gather(*rss_tasks, return_exceptions=True)
+    for _r in _rss_results:
+        if isinstance(_r, BaseException):
+            import traceback
+            print(f"[RSS Task Crash] {type(_r).__name__}: {_r}")
+            traceback.print_exception(type(_r), _r, _r.__traceback__)
 
 # --- ENGINE ORCHESTRATION ---
 
 async def main():
     await init_db()
     print("[*] Threat Feed Engine Active with Corrected Endpoints, Triage Sandbox Links, and Multi-Channel Routing.")
-    
+
     connector = aiohttp.TCPConnector(limit=15, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
-            await asyncio.gather(
+            results = await asyncio.gather(
                 poll_leak_trackers(session),
                 poll_infrastructure(session),
                 poll_threatfox(session),
@@ -1043,7 +1344,14 @@ async def main():
                 poll_rss_streams(session),
                 return_exceptions=True
             )
+
+            for result in results:
+                if isinstance(result, Exception):
+                    print(f"[Collector Error] Unhandled collector failure: {result!r}")
+
             await asyncio.sleep(300)
+
+
 
 if __name__ == "__main__":
     asyncio.run(main())
