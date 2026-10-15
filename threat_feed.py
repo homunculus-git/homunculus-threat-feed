@@ -115,58 +115,64 @@ async def auto_translate_to_english(session: aiohttp.ClientSession, text: str) -
     if sample in TRANSLATION_CACHE:
         return TRANSLATION_CACHE[sample]
 
+    encoded = urllib.parse.quote(sample[:1500])
+    endpoints = [
+        f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=en&q={encoded}",
+        f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q={encoded}",
+    ]
+
     async with TRANSLATION_LOCK:
         if sample in TRANSLATION_CACHE:
             return TRANSLATION_CACHE[sample]
 
-        try:
-            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q={urllib.parse.quote(sample[:3000])}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    detected_lang = data[2] if len(data) > 2 and isinstance(data[2], str) else "auto"
+        for url in endpoints:
+            try:
+                async with session.get(url, headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                    if resp.status != 200:
+                        print(f"[Translation Warning] HTTP {resp.status} from {url.split('?')[0]}")
+                        continue
+                    data = await resp.json(content_type=None)
 
-                    if detected_lang.lower().startswith("en"):
-                        TRANSLATION_CACHE[sample] = (text, False)
-                        return text, False
+                res, src = None, ""
+                if isinstance(data, dict):
+                    src = data.get("src", "") or ""
+                    res = "".join(s.get("trans", "") for s in data.get("sentences", []) if isinstance(s, dict))
+                elif isinstance(data, list):
+                    if data and isinstance(data[0], list):
+                        res = "".join(seg[0] for seg in data[0] if isinstance(seg, list) and seg and seg[0])
+                    elif data and isinstance(data[0], str):
+                        res = " ".join(data)
+                    if len(data) > 2 and isinstance(data[2], str):
+                        src = data[2]
 
-                    if data and data[0]:
-                        res = "".join([segment[0] for segment in data[0] if segment and segment[0]])
-                        if res and res.strip().lower() != sample.strip().lower():
-                            prefix_match = re.match(r'^(\[.*?\]\s*)+', text)
-                            prefix = prefix_match.group(0) if prefix_match else ""
-                            final_res = f"{prefix}{res}".strip()
-                            TRANSLATION_CACHE[sample] = (final_res, True)
-                            await asyncio.sleep(0.2)
-                            return final_res, True
-        except Exception as e:
-            print(f"[Translation Warning] {e}")
+                if src.lower().startswith("en"):
+                    TRANSLATION_CACHE[sample] = (text, False)
+                    return text, False
 
-    TRANSLATION_CACHE[sample] = (text, False)
+                if res and res.strip().lower() != sample.strip().lower():
+                    prefix_match = re.match(r'^(\[.*?\]\s*)+', text)
+                    prefix = prefix_match.group(0) if prefix_match else ""
+                    result = (f"{prefix}{res}".strip(), True)
+                    TRANSLATION_CACHE[sample] = result
+                    await asyncio.sleep(0.3)
+                    return result
+            except Exception as e:
+                print(f"[Translation Warning] {type(e).__name__}: {e}")
+                await asyncio.sleep(0.4)
+
     return text, False
 
 # --- MITRE ATT&CK & THREAT ACTOR ENRICHMENT ENGINES ---
 
 KNOWN_MITRE_GROUPS = {
-    "lockbit": ("G0092", "LockBit"),
-    "clop": ("G0096", "CL0P"),
-    "cl0p": ("G0096", "CL0P"),
-    "blackcat": ("G1017", "BlackCat"),
-    "alphv": ("G1017", "BlackCat (ALPHV)"),
-    "play": ("G1019", "Play"),
     "akira": ("G1024", "Akira"),
-    "blackbasta": ("G1011", "Black Basta"),
-    "qilin": ("G1036", "Qilin"),
-    "rhysida": ("G1035", "Rhysida"),
-    "bianlian": ("G1005", "BianLian"),
-    "medusa": ("G1028", "Medusa"),
-    "8base": ("G1030", "8Base"),
-    "incransom": ("G1037", "Inc Ransom"),
-    "ransomhub": ("G1040", "RansomHub"),
+    "qilin": ("G1050", "Water Galura (Qilin operators)"),
+    "play": ("G1040", "Play"),
+    "incransom": ("G1032", "INC Ransom"),
     "lazarus": ("G0032", "Lazarus Group"),
     "apt29": ("G0016", "APT29 (Cozy Bear)"),
     "apt28": ("G0007", "APT28 (Fancy Bear)"),
-    "scatteredspider": ("G1015", "Scattered Spider")
+    "scatteredspider": ("G1015", "Scattered Spider"),
 }
 
 def get_threat_actor_dossier_links(actor_name: str) -> str:
@@ -505,8 +511,14 @@ async def poll_leak_trackers(session: aiohttp.ClientSession):
                     if await is_duplicate(event_id):
                         continue
 
+                    _m = re.match(r"^\W*(?P<g>.+?)\s+has just published a new victim\s*:\s*(?P<v>.+)$", title.strip(), flags=re.IGNORECASE | re.DOTALL)
+                    if _m and group == "Unattributed":
+                        group = _m.group("g").strip()
+                        victim = _m.group("v").strip() or victim
                     raw_note = entry.get("summary", "") or entry.get("description", "")
                     clean_note = clean_html_to_markdown(raw_note)[:450]
+                    if clean_note.strip().lower() in ("n/a", "na", "none", "-", "unknown"):
+                        clean_note = ""
                     translated_note, was_translated = await auto_translate_to_english(session, clean_note)
 
                     actor_name = group
@@ -525,6 +537,7 @@ async def poll_leak_trackers(session: aiohttp.ClientSession):
                         },
                     ]
 
+                    fields.insert(0, {"name": "Publisher", "value": "Ransomware.live", "inline": True})
                     prefix = "🚨 Ransomware Alert [Translated]:" if was_translated else "🚨 Ransomware Alert:"
                     description = translated_note or clean_note or "New victim published on an extortion leak site."
 
@@ -598,11 +611,21 @@ async def poll_leak_trackers(session: aiohttp.ClientSession):
                                 "inline": False,
                             },
                             {
-                                "name": "Source",
-                                "value": "RansomLook API",
-                                "inline": True,
+                                "name": "Source / Investigation",
+                                "value": (
+                                    "RansomLook API\n"
+                                    f"[Search news](https://news.google.com/search?q={urllib.parse.quote(victim[:80] + ' ransomware', safe='')})"
+                                ),
+                                "inline": False,
                             },
-                        ],
+                        ] + (
+                            [{
+                                "name": "First observed by tracker",
+                                "value": str(post["discovered"])[:19].replace("T", " ") + " UTC",
+                                "inline": False,
+                            }]
+                            if post.get("discovered") else []
+                        ),
                         color=0xE74C3C,
                         mitre_tactics="T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service",
                     )
@@ -792,8 +815,8 @@ async def poll_infrastructure(session: aiohttp.ClientSession):
                                     "value": (
                                         f"[Scan on VirusTotal]({vt_url}) • "
                                         f"[Scan on URLScan.io]({urlscan_link}) • "
-                                        f"[Search on Triage](https://tria.ge/reports?q={urllib.parse.urlparse(raw_url).netloc.split(':')[0]}) • "
-                                        f"[⚡ Open in Ghidra Lab]({TRIAGE_LAB_HOST}/triage?target={urllib.parse.quote(raw_url, safe='')})"
+                                        f"[Search on Triage](https://tria.ge/reports?q={urllib.parse.urlparse(raw_url).netloc.split(':')[0]})"
+                                        + (f" • [⚡ Open in Ghidra Lab]({TRIAGE_LAB_HOST}/triage?target={urllib.parse.quote(raw_url, safe='')})" if len(raw_url) < 120 else "")
                                     ),
                                     "inline": False
                                 }
@@ -1161,21 +1184,21 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
                                     "active_since": "2019",
                                     "motivation": "Financially motivated ransomware / extortion",
                                     "ttps": "T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service • T1059 Command Scripting",
-                                    "research": "[MITRE G0092](https://attack.mitre.org/groups/G0092/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.lockbit)"
+                                    "research": "[Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.lockbit)"
                                 },
                                 "cl0p": {
                                     "actor": "CL0P",
                                     "active_since": "2019",
                                     "motivation": "Financially motivated data theft & zero-day extortion",
                                     "ttps": "T1190 Exploit Public-Facing App • T1567 Exfiltration Over Web Service",
-                                    "research": "[MITRE G0096](https://attack.mitre.org/groups/G0096/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.clop)"
+                                    "research": "[Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.clop)"
                                 },
                                 "blackcat": {
                                     "actor": "BlackCat / ALPHV",
                                     "active_since": "2021",
                                     "motivation": "Financially motivated double-extortion RaaS",
                                     "ttps": "T1486 Data Encrypted for Impact • T1059 Command Scripting",
-                                    "research": "[MITRE G1017](https://attack.mitre.org/groups/G1017/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.blackcat)"
+                                    "research": "[Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.blackcat)"
                                 },
                                 "qilin": {
                                     "actor": "Qilin (Agenda)",
@@ -1196,21 +1219,21 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
                                     "active_since": "2022",
                                     "motivation": "Financially motivated extortion & credential abuse",
                                     "ttps": "T1190 Exploit Public App • T1059 Command Scripting",
-                                    "research": "[MITRE G1019](https://attack.mitre.org/groups/G1019/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.play)"
+                                    "research": "[MITRE G1040](https://attack.mitre.org/groups/G1040/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.play)"
                                 },
                                 "blackbasta": {
                                     "actor": "Black Basta",
                                     "active_since": "2022",
                                     "motivation": "Financially motivated targeted extortion RaaS",
                                     "ttps": "T1566 Spearphishing • T1486 Data Encrypted for Impact",
-                                    "research": "[MITRE G1011](https://attack.mitre.org/groups/G1011/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.blackbasta)"
+                                    "research": "[Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.blackbasta)"
                                 },
                                 "ransomhub": {
                                     "actor": "RansomHub",
                                     "active_since": "2024",
                                     "motivation": "Financially motivated high-payout double-extortion RaaS",
                                     "ttps": "T1486 Data Encrypted for Impact • T1567 Exfiltration",
-                                    "research": "[MITRE G1040](https://attack.mitre.org/groups/G1040/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.ransomhub)"
+                                    "research": "[Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.ransomhub)"
                                 }
                             }
 
