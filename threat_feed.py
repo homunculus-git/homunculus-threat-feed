@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from victim_attack_surface import probe_victim_surface, format_attack_surface_field
+from actor_ttps import format_actor_ttp_field
 import os
 import re
 import csv
@@ -128,7 +128,7 @@ async def auto_translate_to_english(session: aiohttp.ClientSession, text: str) -
     if not text or not text.strip():
         return "", False
 
-    cleaned = re.sub(r'\[.*?\]', '', text).strip()
+    cleaned = re.sub(r"\[.*?\]", "", text).strip()
     sample = cleaned if len(cleaned) > 5 else text
 
     if sample in TRANSLATION_CACHE:
@@ -136,8 +136,9 @@ async def auto_translate_to_english(session: aiohttp.ClientSession, text: str) -
 
     encoded = urllib.parse.quote(sample[:1500])
     endpoints = [
+        f"https://translate.googleapis.com/translate_a/single?client=at&sl=auto&tl=en&dt=t&dj=1&q={encoded}",
         f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=en&q={encoded}",
-        f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q={encoded}",
+        f"https://lingva.ml/api/v1/auto/en/{encoded}",
     ]
 
     async with TRANSLATION_LOCK:
@@ -146,16 +147,19 @@ async def auto_translate_to_english(session: aiohttp.ClientSession, text: str) -
 
         for url in endpoints:
             try:
-                async with session.get(url, headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                async with session.get(url, headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=7)) as resp:
                     if resp.status != 200:
-                        print(f"[Translation Warning] HTTP {resp.status} from {url.split('?')[0]}")
                         continue
                     data = await resp.json(content_type=None)
 
-                res, src = None, ""
+                res, src = "", ""
                 if isinstance(data, dict):
-                    src = data.get("src", "") or ""
-                    res = "".join(s.get("trans", "") for s in data.get("sentences", []) if isinstance(s, dict))
+                    if "sentences" in data:
+                        res = "".join(s.get("trans", "") for s in data.get("sentences", []) if isinstance(s, dict))
+                        src = data.get("src", "")
+                    elif "translation" in data:
+                        res = data.get("translation", "")
+                        src = data.get("info", {}).get("detectedSource", "")
                 elif isinstance(data, list):
                     if data and isinstance(data[0], list):
                         res = "".join(seg[0] for seg in data[0] if isinstance(seg, list) and seg and seg[0])
@@ -164,19 +168,18 @@ async def auto_translate_to_english(session: aiohttp.ClientSession, text: str) -
                     if len(data) > 2 and isinstance(data[2], str):
                         src = data[2]
 
-                if src.lower().startswith("en"):
+                if src and src.lower().startswith("en"):
                     TRANSLATION_CACHE[sample] = (text, False)
                     return text, False
 
                 if res and res.strip().lower() != sample.strip().lower():
-                    prefix_match = re.match(r'^(\[.*?\]\s*)+', text)
+                    prefix_match = re.match(r"^(\[.*?\]\s*)+", text)
                     prefix = prefix_match.group(0) if prefix_match else ""
                     result = (f"{prefix}{res}".strip(), True)
                     TRANSLATION_CACHE[sample] = result
                     await asyncio.sleep(0.3)
                     return result
-            except Exception as e:
-                print(f"[Translation Warning] {type(e).__name__}: {e}")
+            except Exception:
                 await asyncio.sleep(0.4)
 
     return text, False
@@ -400,49 +403,42 @@ async def is_first_run() -> bool:
             return not row or row[0] == 0
 
 
+def format_clean_date(raw_dt) -> str:
+    """Converts any raw timestamp into clean "03 Nov 2026 • 16:15:22 UTC" format."""
+    if not raw_dt:
+        return datetime.now(timezone.utc).strftime("%d %b %Y • %H:%M:%S UTC")
+    s = str(raw_dt).strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s[:19], fmt)
+            return dt.strftime("%d %b %Y • %H:%M:%S UTC")
+        except ValueError:
+            pass
+    return s
+
+
 def clamp_discord_embed(embed: dict) -> dict:
-    # Ensure description does not starve fields of character allowance
     if len(embed.get("description", "")) > 1400:
         embed["description"] = embed["description"][:1400] + "..."
+
     fields = embed.get("fields") or []
-    # If no feed source provided a published date, use UTC timestamp
-    has_date = any(k in str(f.get("name", "")).lower() for f in fields for k in ["published", "first seen", "discovered", "date added", "date"])
+    has_date = any(any(k in str(f.get("name", "")).lower() for k in ["date", "seen", "discovered", "added", "published", "observed"]) for f in fields)
     if not has_date:
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        fields.append({"name": "🕒 Discovered UTC", "value": f"`{now_str}`", "inline": True})
-        embed["fields"] = fields
-    fields = embed.get("fields") or []
-    # Clean up any generic ingested UTC if a real event/tracker date is present
-    has_event_date = any(k in str(f.get("name", "")).lower() for f in fields for k in ["first seen", "discovered", "published", "release", "date added", "published date"])
-    if has_event_date:
-        fields = [f for f in fields if "ingested utc" not in str(f.get("name", "")).lower()]
-        embed["fields"] = fields
-    else:
-        # If no source date exists in the upstream feed, format as Detected Date
-        now_dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        if not any("date" in str(f.get("name", "")).lower() for f in fields):
-            fields.append({"name": "📅 Event Date", "value": f"`{now_dt}`", "inline": True})
-            embed["fields"] = fields
-    now_utc = datetime.now(timezone.utc)
-    if "timestamp" not in embed:
-        embed["timestamp"] = now_utc.isoformat()
-    
-    current_fields = embed.get("fields") or []
-    has_date = any("date" in str(f.get("name", "")).lower() or "utc" in str(f.get("name", "")).lower() for f in current_fields)
-    if not has_date:
-        current_fields.append({
-            "name": "📅 Ingested UTC",
-            "value": f"`{now_utc.strftime('%Y-%m-%d %H:%M:%S')}`",
-            "inline": True
-        })
-        embed["fields"] = current_fields
+        now_str = datetime.now(timezone.utc).strftime("%d %b %Y • %H:%M:%S UTC")
+        if fields and fields[0].get("inline"):
+            fields.insert(1, {"name": "\u200b", "value": "\u200b", "inline": True})
+            fields.insert(2, {"name": "Date Discovered", "value": f"`{now_str}`", "inline": True})
+        else:
+            fields.append({"name": "Date Discovered", "value": f"`{now_str}`", "inline": True})
+
+    embed.pop("timestamp", None)
+
     embed["title"] = (embed.get("title") or "")[:256]
     embed["description"] = (embed.get("description") or "")[:2000]
 
-    fields = embed.get("fields") or []
     limited_fields = []
     total_length = len(embed["title"]) + len(embed["description"])
-    footer_text = embed.get("footer", {}).get("text", "")
+    footer_text = embed.get("footer", {}).get("text", "") if embed.get("footer") else ""
     total_length += len(footer_text)
 
     for field in fields[:25]:
@@ -459,22 +455,7 @@ def clamp_discord_embed(embed: dict) -> dict:
 
 
 async def ensure_victim_attack_surface(session: aiohttp.ClientSession, title: str, fields: list) -> None:
-    for f in fields:
-        if "attack surface" in str(f.get("name", "")).lower():
-            return
-    m = re.search(r"Alert(?:\s*\[[^\]]+\])?:\s*(.+?)(?:\s*—\s*claimed by|\s*$)", title, re.IGNORECASE)
-    if not m:
-        return
-    victim_candidate = m.group(1).strip()
-    victim_candidate = re.sub(r"^[^a-zA-Z0-9]+|[*_`]", "", victim_candidate).strip()
-    if not victim_candidate or len(victim_candidate) < 2:
-        return
-    try:
-        surf_meta = await probe_victim_surface(session, victim_candidate)
-        fields.append(format_attack_surface_field(surf_meta))
-    except Exception:
-        pass
-
+    return
 
 async def dispatch_discord_embed(
     session: aiohttp.ClientSession,
@@ -496,16 +477,11 @@ async def dispatch_discord_embed(
         print(f"[Discord Error] {channel_key}: invalid webhook URL")
         return False
 
-    footer_text = "Homunculus CTI Core • Automated Threat Stream"
-    if mitre_tactics:
-        footer_text = f"ATT&CK: {mitre_tactics} • {footer_text}"
-
     if channel_key == "ransomware":
-
-
         await ensure_victim_attack_surface(session, title, fields)
 
-
+    now_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    footer_text = f"ATT&CK: {mitre_tactics} • {now_stamp}" if mitre_tactics else now_stamp
 
     embed = {
         "title": title,
@@ -642,11 +618,7 @@ async def poll_leak_trackers(session: aiohttp.ClientSession):
                         },
                     ]
 
-                    try:
-                        surf_meta = await probe_victim_surface(session, victim, threat_actor=group)
-                        fields.append(format_attack_surface_field(surf_meta))
-                    except Exception as s_err:
-                        print(f"[Attack Surface Warning] Ransomware.live: {s_err}")
+                    fields.append(format_actor_ttp_field(group))
 
                     raw_pub = str(entry.get("published") or entry.get("updated") or "").strip()
                     if raw_pub:
@@ -657,8 +629,10 @@ async def poll_leak_trackers(session: aiohttp.ClientSession):
                             clean_pub = raw_pub.replace("+0000", "UTC").replace("GMT", "UTC")
                     else:
                         clean_pub = "Not provided by source"
+                    clean_pub_fmt = format_clean_date(raw_pub)
                     fields.insert(0, {"name": "Publisher", "value": "Ransomware.live", "inline": True})
-                    fields.insert(1, {"name": "📅 Published Date", "value": f"`{clean_pub}`", "inline": True})
+                    fields.insert(1, {"name": "\u200b", "value": "\u200b", "inline": True})
+                    fields.insert(2, {"name": "Date Discovered", "value": f"`{clean_pub_fmt}`", "inline": True})
                     prefix = "🚨 Ransomware Alert [Translated]:" if was_translated else "🚨 Ransomware Alert:"
                     description = translated_note or clean_note or "New victim published on an extortion leak site."
 
@@ -733,17 +707,12 @@ async def poll_leak_trackers(session: aiohttp.ClientSession):
                         },
                     ]
                     if post.get("discovered"):
-                        rl_fields.append({
-                            "name": "First observed by tracker",
-                            "value": str(post["discovered"])[:100],
-                            "inline": False,
-                        })
+                        clean_obs = format_clean_date(post["discovered"])
+                        rl_fields.insert(0, {"name": "Threat Actor", "value": f"**{group}**", "inline": True})
+                        rl_fields.insert(1, {"name": "\u200b", "value": "\u200b", "inline": True})
+                        rl_fields.insert(2, {"name": "First Observed", "value": f"`{clean_obs}`", "inline": True})
 
-                    try:
-                        surf_meta = await probe_victim_surface(session, victim, threat_actor=group)
-                        rl_fields.append(format_attack_surface_field(surf_meta))
-                    except Exception as s_err:
-                        print(f"[Attack Surface Warning] RansomLook: {s_err}")
+                    rl_fields.append(format_actor_ttp_field(group))
 
                     dispatched = await dispatch_discord_embed(
                         session=session,
@@ -828,11 +797,7 @@ async def poll_leak_trackers(session: aiohttp.ClientSession):
                     },
                 ]
 
-                try:
-                    surf_meta = await probe_victim_surface(session, victim, threat_actor=group)
-                    rw_fields.append(format_attack_surface_field(surf_meta))
-                except Exception as s_err:
-                    print(f"[Attack Surface Warning] Ransomwatch: {s_err}")
+                rw_fields.append(format_actor_ttp_field(group))
 
                 dispatched = await dispatch_discord_embed(
                     session=session,
@@ -916,7 +881,7 @@ async def poll_infrastructure(session: aiohttp.ClientSession):
                                 description="Host operating a blacklisted SSL/TLS certificate associated with malware C2.",
                                 fields=[
                                     {"name": "Server Endpoint", "value": f"`{bad_ip}:{bad_port}`", "inline": True},
-                                    {"name": "First Seen (UTC)", "value": seen_time, "inline": True},
+                                    {"name": "Date Discovered", "value": seen_time, "inline": True},
                                     {"name": "Infrastructure Profile", "value": f"[Investigate IP on VirusTotal]({vt_ip_url})", "inline": False}
                                 ],
                                 color=0xD35400,
@@ -949,20 +914,23 @@ async def poll_infrastructure(session: aiohttp.ClientSession):
                         # Correlation targeting Screenshot 1 format
                         live_c2 = await get_live_c2_for_family(session, detected_family)
                         if live_c2:
-                            c2_display = f"`{live_c2}`"
+                            c2_display = str(live_c2)
                         elif detected_family.lower() in ("mozi", "hns", "hajime"):
                             c2_display = "P2P DHT Swarm (Decentralized Botnet)"
                         else:
-                            c2_display = "No confirmed active C2 on record for campaign"
+                            c2_display = "Unconfirmed / No Active C2 Record"
                         
+                        delivery_val = str(infra.get("routing") or "Unknown Routing")
                         correlation_text = (
-                            f"• **Stage 1 (Delivery):** Staged on {infra['routing']}\n"
-                            f"• **Stage 2 (Command & Control):** {c2_display}"
-                        )
+                            "```ansi\n"
+                            f"\u001b[2;34mStage 1 (Delivery){reset} : \u001b[2;32m{delivery_val}{reset}\n"
+                            f"\u001b[2;34mStage 2 (C2)      {reset} : \u001b[2;32m{c2_display}{reset}\n"
+                            "```"
+                        ).replace("{reset}", "\u001b[0m")
                         
                         url_status = item.get("url_status") or "online"
                         fields = [
-                            {"name": "📅 Date Added UTC", "value": f"`{str(item.get('date_added') or 'Not provided')[:19]} UTC`", "inline": True},
+                            {"name": "Date Added", "value": f"`{format_clean_date(item.get('date_added'))}`", "inline": True},
                             {"name": "Malware / Botnet Family", "value": f"**{detected_family}**", "inline": True},
                             {"name": "Threat Database", "value": f"[View URLhaus Dossier]({urlhaus_dossier})", "inline": True},
                             {"name": "Routing & ASN", "value": infra["routing"], "inline": False},
@@ -1102,7 +1070,7 @@ async def poll_threatfox(session: aiohttp.ClientSession):
                             
                             dns_status = await check_c2_dns(ioc_val, item.get("ioc_type"))
                             fields = [
-            {"name": "📅 First Seen UTC", "value": f"`{str(item.get('first_seen_utc') or item.get('first_seen') or 'Not provided')[:19]} UTC`", "inline": True},
+            {"name": "Date Discovered", "value": f"`{format_clean_date(item.get('first_seen_utc') or item.get('first_seen'))}`", "inline": True},
                                 {"name": "Malware / Campaign", "value": f"**{malware}**", "inline": True},
                                 {"name": "Indicator Type", "value": f"`{item.get('ioc_type') or 'unknown'}`", "inline": True},
                                 {"name": "Confidence Score", "value": f"`{confidence}%`", "inline": True},
@@ -1342,7 +1310,12 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
             for entry in entries:
                 entry_link = entry.get("link", "")
                 raw_id = entry.get("id") or entry_link
-                event_id = f"tc_{raw_id}" if publisher == "ThreatCluster" else get_stable_id("rss", raw_id)
+                if publisher == "ThreatCluster":
+                        tc_actor = raw_title.split("— claimed by", 1)[-1].strip() if "— claimed by" in raw_title else "Unattributed"
+                        tc_victim = raw_title.split("— claimed by", 1)[0].replace("Dark Web Victim Stream:", "").strip()
+                        event_id = normalize_leak_event_id(tc_actor, tc_victim)
+                    else:
+                        event_id = get_stable_id("rss", raw_id)
 
                 if not await is_duplicate(event_id):
                     raw_title = entry.get("title", "Untitled feed entry")
@@ -1410,86 +1383,20 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
 
                         if publisher == "ThreatCluster":
                             actor_text = raw_title.split("— claimed by", 1)[-1].strip() if "— claimed by" in raw_title else "Unattributed"
-                            actor_key = re.sub(r"[^a-z0-9]", "", actor_text.lower())
+                            victim_text = raw_title.split("— claimed by", 1)[0].replace("Dark Web Victim Stream:", "").strip()
+                            display_title = f"🚨 Ransomware Alert: {victim_text}"
 
-                            actor_profiles = {
-                                "lockbit": {
-                                    "actor": "LockBit",
-                                    "active_since": "2019",
-                                    "motivation": "Financially motivated ransomware / extortion",
-                                    "ttps": "T1486 Data Encrypted for Impact • T1567 Exfiltration Over Web Service • T1059 Command Scripting",
-                                    "research": "[Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.lockbit)"
-                                },
-                                "cl0p": {
-                                    "actor": "CL0P",
-                                    "active_since": "2019",
-                                    "motivation": "Financially motivated data theft & zero-day extortion",
-                                    "ttps": "T1190 Exploit Public-Facing App • T1567 Exfiltration Over Web Service",
-                                    "research": "[Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.clop)"
-                                },
-                                "blackcat": {
-                                    "actor": "BlackCat / ALPHV",
-                                    "active_since": "2021",
-                                    "motivation": "Financially motivated double-extortion RaaS",
-                                    "ttps": "T1486 Data Encrypted for Impact • T1059 Command Scripting",
-                                    "research": "[Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.blackcat)"
-                                },
-                                "qilin": {
-                                    "actor": "Qilin (Agenda)",
-                                    "active_since": "2022",
-                                    "motivation": "Financially motivated Rust/Go ransomware-as-a-service",
-                                    "ttps": "T1486 Data Encrypted for Impact • T1059 Command Scripting • T1567 Exfiltration",
-                                    "research": "[MITRE G1050](https://attack.mitre.org/groups/G1050/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/elf.qilin)"
-                                },
-                                "akira": {
-                                    "actor": "Akira",
-                                    "active_since": "2023",
-                                    "motivation": "Financially motivated double-extortion enterprise RaaS",
-                                    "ttps": "T1133 External Remote Services • T1486 Data Encrypted for Impact",
-                                    "research": "[MITRE G1024](https://attack.mitre.org/groups/G1024/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.akira)"
-                                },
-                                "play": {
-                                    "actor": "Play Ransomware",
-                                    "active_since": "2022",
-                                    "motivation": "Financially motivated extortion & credential abuse",
-                                    "ttps": "T1190 Exploit Public App • T1059 Command Scripting",
-                                    "research": "[MITRE G1040](https://attack.mitre.org/groups/G1040/) • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.play)"
-                                },
-                                "blackbasta": {
-                                    "actor": "Black Basta",
-                                    "active_since": "2022",
-                                    "motivation": "Financially motivated targeted extortion RaaS",
-                                    "ttps": "T1566 Spearphishing • T1486 Data Encrypted for Impact",
-                                    "research": "[Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.blackbasta)"
-                                },
-                                "ransomhub": {
-                                    "actor": "RansomHub",
-                                    "active_since": "2024",
-                                    "motivation": "Financially motivated high-payout double-extortion RaaS",
-                                    "ttps": "T1486 Data Encrypted for Impact • T1567 Exfiltration",
-                                    "research": "[Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/win.ransomhub)"
-                                }
-                            }
+                            clean_date = format_clean_date(str(entry.get("published") or entry.get("updated") or ""))
+                            actor_dossier = get_threat_actor_dossier_links(actor_text)
 
-                            profile = actor_profiles.get(actor_key)
-                            if profile:
-                                fields.append({
-                                    "name": "Threat Actor Dossier",
-                                    "value": (
-                                        f"**Actor:** {profile['actor']} (Active since {profile['active_since']})\n"
-                                        f"**Motivation:** {profile['motivation']}\n"
-                                        f"**Common ATT&CK:** {profile['ttps']}\n"
-                                        f"**Dossier Research:** {profile['research']}"
-                                    ),
-                                    "inline": False
-                                })
-                            else:
-                                search_actor = urllib.parse.quote(actor_text)
-                                fields.append({
-                                    "name": "Threat Actor",
-                                    "value": f"**{actor_text}** • [Search MITRE](https://attack.mitre.org/?q={search_actor}) • [Search Malpedia](https://malpedia.caad.fkie.fraunhofer.de/search#query={search_actor})",
-                                    "inline": False
-                                })
+                            fields = [
+                                {"name": "Threat Actor", "value": f"**{actor_text}**", "inline": True},
+                                {"name": "\u200b", "value": "\u200b", "inline": True},
+                                {"name": "First Observed", "value": f"`{clean_date}`", "inline": True},
+                                {"name": "Threat Actor Dossier", "value": actor_dossier, "inline": False},
+                                {"name": "Discovery Link", "value": f"[Inspect Leak Page]({entry_link})" if entry_link else "Not provided", "inline": False},
+                                format_actor_ttp_field(actor_text)
+                            ]
 
                         if channel_key == "podcasts" or "🎙" in alert_type or "🎧" in alert_type:
                             alert_mitre = None
