@@ -26,3 +26,21 @@ install_*.py
 register_*.py
 split_*.py
 add_*.py
+
+# Secrets and runtime state
+.env
+threat_cache.db
+*.db-journal
+
+# Patch backups and one-off artifacts
+threat_feed.py.*
+threat_feed_*.txt
+threat_feed_source.tar.gz
+*.before_*
+__pycache__/
+.venv/
+
+# Ghidra project and malware samples
+Threat Lab.gpr
+Threat Lab.rep/
+samples/

@@ -1308,17 +1308,16 @@ async def fetch_and_process_rss(session: aiohttp.ClientSession, publisher: str, 
             entries = feed.entries[:bootstrap_limit] if bootstrap_limit else feed.entries[:6]
 
             for entry in entries:
+                raw_title = entry.get("title", "Untitled feed entry")
                 entry_link = entry.get("link", "")
                 raw_id = entry.get("id") or entry_link
                 if publisher == "ThreatCluster":
-                        tc_actor = raw_title.split("— claimed by", 1)[-1].strip() if "— claimed by" in raw_title else "Unattributed"
-                        tc_victim = raw_title.split("— claimed by", 1)[0].replace("Dark Web Victim Stream:", "").strip()
-                        event_id = normalize_leak_event_id(tc_actor, tc_victim)
-                    else:
-                        event_id = get_stable_id("rss", raw_id)
-
+                    tc_actor = raw_title.split("— claimed by", 1)[-1].strip() if "— claimed by" in raw_title else "Unattributed"
+                    tc_victim = raw_title.split("— claimed by", 1)[0].replace("Dark Web Victim Stream:", "").strip()
+                    event_id = normalize_leak_event_id(tc_actor, tc_victim)
+                else:
+                    event_id = get_stable_id("rss", raw_id)
                 if not await is_duplicate(event_id):
-                    raw_title = entry.get("title", "Untitled feed entry")
                     raw_content = entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else "")
                     if channel_key == "podcasts" or "🎙" in alert_type or "🎧" in alert_type:
                         sc_stories = []
