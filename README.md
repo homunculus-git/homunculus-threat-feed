@@ -16,7 +16,7 @@ A real-time cyber threat intelligence aggregator that streams 30+ curated feeds 
 
 ## Intelligence Feeds & Alert Specifications
 
-Homunculus normalizes multi-source intelligence into standardized alert formats mapped to the MITRE ATT&CK framework:
+Normalizes multi-source intelligence into standardized alert formats mapped to the MITRE ATT&CK framework:
 
 ### 1. Government Advisories & CERT Bulletins
 
