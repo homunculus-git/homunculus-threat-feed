@@ -1,6 +1,6 @@
 # Homunculus Threat Feed
 
-**Homunculus** is a real-time cyber threat intelligence aggregator that streams 30+ curated feeds into Discord (with WhatsApp and Telegram support). Built for SOC analysts, threat hunters, and security teams who need immediate visibility into emerging threats without noise or duplication.
+A real-time cyber threat intelligence aggregator that streams 30+ curated feeds into Discord (with WhatsApp and Telegram support). Built for SOC analysts, threat hunters, and security teams who need immediate visibility into emerging threats without noise or duplication.
 
 ## Features
 
