@@ -3,124 +3,269 @@ import urllib.parse
 
 RANSOM_ACTOR_PROFILES = {
     "lockbit": {
-        "actor": "LockBit 3.0 (Black)",
-        "assessed_base": "Russia / CIS (High Confidence)",
-        "tools": "Mimikatz, Process Hacker, StealBit, rclone",
-        "ttps": "T1190 (Exploit Public App) • T1059 (Scripting) • T1486 (Encryption)",
+        "actor": "LockBit 3.0",
+        "origin_country": "Russia / CIS (High Confidence)",
         "mitre_type": "software",
         "mitre_id": "S1202",
+        "malpedia": "win.lockbit",
     },
     "akira": {
         "actor": "Akira",
-        "assessed_base": "Russia / CIS (Moderate Confidence)",
-        "tools": "AnyDesk, RustDesk, Advanced IP Scanner, rclone, PCHunter",
-        "ttps": "T1133 (External Services) • T1567 (Exfil Over Cloud) • T1486 (Encryption)",
+        "origin_country": "Russia / CIS (Moderate Confidence)",
         "mitre_type": "groups",
         "mitre_id": "G1024",
+        "malpedia": "win.akira",
     },
     "qilin": {
         "actor": "Qilin (Agenda)",
-        "assessed_base": "Russia / CIS (Moderate Confidence)",
-        "tools": "Cobalt Strike, PsExec, Chisel, MegaSync",
-        "ttps": "T1566 (Phishing) • T1021 (Remote Services) • T1486 (Encryption)",
+        "origin_country": "Russia / CIS (Moderate Confidence)",
         "mitre_type": "groups",
         "mitre_id": "G1050",
+        "malpedia": "win.agendacrypt",
     },
     "play": {
         "actor": "Play Ransomware",
-        "assessed_base": "Eastern Europe / CIS (Moderate Confidence)",
-        "tools": "AdFind, GMER, Cobalt Strike, SystemInformer",
-        "ttps": "T1190 (Exploit Public App) • T1078 (Valid Accounts) • T1486 (Encryption)",
+        "origin_country": "Eastern Europe / CIS (Moderate Confidence)",
         "mitre_type": "groups",
         "mitre_id": "G1040",
+        "malpedia": "win.play",
     },
     "blackbasta": {
-        "actor": "Black Basta (Storm-1811)",
-        "assessed_base": "Russia (High Confidence)",
-        "tools": "BitzTransfer, BSoft, PsExec, Quick Assist, SoftPerf",
-        "ttps": "T1566 (Phishing) • T1684 (Impersonation) • T1486 (Encryption)",
+        "actor": "Black Basta",
+        "origin_country": "Russia (High Confidence)",
         "mitre_type": "groups",
         "mitre_id": "G1046",
+        "malpedia": "win.blackbasta",
     },
     "cl0p": {
         "actor": "CL0P (TA505)",
-        "assessed_base": "Russia (High Confidence)",
-        "tools": "DEWMODE, TrueBot, SDBbot, Cobalt Strike",
-        "ttps": "T1190 (Exploit Public App) • T1567 (Exfiltration) • T1499 (Exhaustion)",
+        "origin_country": "Russia (High Confidence)",
         "mitre_type": "groups",
         "mitre_id": "G0092",
+        "malpedia": "win.clop",
     },
     "ransomhub": {
         "actor": "RansomHub",
-        "assessed_base": "Russia / Dispersed Affiliates (Moderate Confidence)",
-        "tools": "EDRKillShifter, Mimikatz, PuTTY, Scapa",
-        "ttps": "T1190 (Exploit Public App) • T1562 (Disable Defense) • T1486 (Encryption)",
+        "origin_country": "Russia / Dispersed Affiliates (Moderate Confidence)",
         "mitre_type": None,
         "mitre_id": None,
+        "malpedia": "win.ransomhub",
     },
     "incransom": {
         "actor": "INC Ransom",
-        "assessed_base": "Dispersed / Multi-National (Low Confidence)",
-        "tools": "AnyDesk, MegaSync, Sshuttle, NetScan",
-        "ttps": "T1190 (Exploit Public App) • T1021 (Remote Services) • T1486 (Encryption)",
+        "origin_country": "Dispersed / Multi-National (Moderate Confidence)",
         "mitre_type": "groups",
         "mitre_id": "G1032",
+        "malpedia": "win.inc",
     },
     "rhysida": {
         "actor": "Rhysida",
-        "assessed_base": "Russia / CIS (Moderate Confidence)",
-        "tools": "PsExec, AnyDesk, Port Scanner, secretsdump",
-        "ttps": "T1078 (Valid Accounts) • T1059 (Scripting) • T1486 (Encryption)",
+        "origin_country": "Russia / CIS (Moderate Confidence)",
         "mitre_type": "groups",
         "mitre_id": "G1025",
+        "malpedia": "win.rhysida",
     },
     "medusa": {
         "actor": "Medusa",
-        "assessed_base": "Unknown / Dispersed (Low Confidence)",
-        "tools": "ConnectWise, PDQ Deploy, MegaSync, Angry IP Scanner",
-        "ttps": "T1133 (External Services) • T1562 (Impair Defenses) • T1486 (Encryption)",
+        "origin_country": "Unknown / Dispersed Affiliates",
         "mitre_type": None,
         "mitre_id": None,
+        "malpedia": "win.medusa",
+    },
+    "bianlian": {
+        "actor": "BianLian",
+        "origin_country": "Russia / Eastern Europe (Moderate Confidence)",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": "win.bianlian",
+    },
+    "blackcat": {
+        "actor": "BlackCat (ALPHV)",
+        "origin_country": "Russia (High Confidence)",
+        "mitre_type": "groups",
+        "mitre_id": "G1010",
+        "malpedia": "win.blackcat",
+    },
+    "alphv": {
+        "actor": "BlackCat (ALPHV)",
+        "origin_country": "Russia (High Confidence)",
+        "mitre_type": "groups",
+        "mitre_id": "G1010",
+        "malpedia": "win.blackcat",
+    },
+    "cactus": {
+        "actor": "Cactus",
+        "origin_country": "Eastern Europe / Dispersed Affiliates",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": "win.cactus",
+    },
+    "8base": {
+        "actor": "8Base",
+        "origin_country": "Russia / Eastern Europe (Moderate Confidence)",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": "win.8base",
+    },
+    "cuba": {
+        "actor": "Cuba Ransomware",
+        "origin_country": "Russia (Moderate Confidence)",
+        "mitre_type": "groups",
+        "mitre_id": "G0125",
+        "malpedia": "win.cuba",
+    },
+    "snatch": {
+        "actor": "Snatch",
+        "origin_country": "Russia (Moderate Confidence)",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": "win.snatch",
+    },
+    "hunters": {
+        "actor": "Hunters International",
+        "origin_country": "Dispersed / Global (Moderate Confidence)",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": "win.hunters_international",
+    },
+    "safepay": {
+        "actor": "SafePay",
+        "origin_country": "Unknown / Emerging Syndicate",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": "win.safepay",
+    },
+    "thegentlemen": {
+        "actor": "Thegentlemen",
+        "origin_country": "Unknown / Emerging Syndicate",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": "win.gentlemen",
+    },
+    "blacksuit": {
+        "actor": "BlackSuit",
+        "origin_country": "Russia / Eastern Europe",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": "win.blacksuit",
+    },
+    "fog": {
+        "actor": "Fog",
+        "origin_country": "Unknown / Emerging Syndicate",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": "win.fog",
+    },
+    "embargo": {
+        "actor": "Embargo",
+        "origin_country": "Unknown / Emerging Syndicate",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": None,
+    },
+    "dragonforce": {
+        "actor": "DragonForce",
+        "origin_country": "Malaysia / Dispersed Affiliates",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": None,
+    },
+    "whitearmor": {
+        "actor": "WhiteArmor",
+        "origin_country": "Unknown / Emerging Syndicate",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": None,
+    },
+    "payload": {
+        "actor": "Payload",
+        "origin_country": "Unknown / Emerging Syndicate",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": None,
+    },
+    "n0n": {
+        "actor": "N0n",
+        "origin_country": "Unknown / Emerging Syndicate",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": None,
+    },
+    "boobaproject": {
+        "actor": "Booba project",
+        "origin_country": "Unknown / Emerging Syndicate",
+        "mitre_type": None,
+        "mitre_id": None,
+        "malpedia": None,
     },
 }
 
-def format_actor_ttp_field(threat_actor: str) -> dict:
-    slug = re.sub(r"[^a-z0-9]", "", (threat_actor or "").lower())
-    data = RANSOM_ACTOR_PROFILES.get(slug)
+def format_threat_actor_info(
+    threat_actor: str,
+    stat_line: str = None,
+    *,
+    publisher: str = None,
+    extra_dossier_link: str = None,
+) -> dict:
+    cleaned = (threat_actor or "").strip()
+    slug = re.sub(r"[^a-z0-9]", "", cleaned.lower())
 
-    if data:
-        if data.get("mitre_id"):
-            m_url = f"https://attack.mitre.org/{data['mitre_type']}/{data['mitre_id']}/"
-            mitre_link = f"[MITRE {data['mitre_id']}]({m_url})"
-        else:
-            q = urllib.parse.quote(data["actor"])
-            mitre_link = f"[Search MITRE](https://attack.mitre.org/?q={q})"
+    if not slug or slug in ("unattributed", "unknown", "unspecified", "anonymous", "none", "na"):
+        return {
+            "name": "Threat Actor Info",
+            "value": (
+                "```yaml\n"
+                "Name           : Unattributed\n"
+                "Origin Country : Unknown / Unconfirmed\n"
+                "Activity Stat  : No specific syndicate attributed to this claim\n"
+                "```"
+            ),
+            "inline": False,
+        }
 
-        base_val = data.get("assessed_base", "Unattributed / Global")
-        val = (
-            "```yaml\n"
-            f"Adversary     : {data['actor']}\n"
-            f"Status        : Active Threat Syndicate\n"
-            f"Assessed Base : {base_val}\n"
-            f"Typical Tools : {data['tools']}\n"
-            f"Top TTPs      : {data['ttps']}\n"
-            "```\n"
-            f"🎯 Research: {mitre_link} • [Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/actor.{slug})"
-        )
+    profile = RANSOM_ACTOR_PROFILES.get(slug)
+    actor_name = profile["actor"] if profile else cleaned
+    origin = profile.get("origin_country", "Unknown / Unconfirmed Origin") if profile else "Unknown / Unconfirmed Origin"
+    stat = stat_line or "Activity Stat  : Active monitored syndicate in threat feed cache"
+
+    dossier_links = []
+    if profile and profile.get("mitre_id"):
+        mtype = profile.get("mitre_type") or "groups"
+        gid = profile["mitre_id"]
+        dossier_links.append(f"[MITRE {gid}](https://attack.mitre.org/{mtype}/{gid}/)")
     else:
-        q = urllib.parse.quote(threat_actor or "Unattributed")
-        val = (
-            "```yaml\n"
-            f"Adversary     : {threat_actor or 'Unattributed'}\n"
-            "Status        : Emerging / Unprofiled Syndicate\n"
-            "Assessed Base : Unattributed / Global\n"
-            "Standard TTPs : T1190 (Edge Exploit) • T1133 (VPN/RDP) • T1567 (Exfil)\n"
-            "```\n"
-            f"🔍 Investigate: [Search MITRE ATT&CK](https://attack.mitre.org/?q={q}) • [Search Malpedia](https://malpedia.caad.fkie.fraunhofer.de/search?q={q})"
-        )
+        q = urllib.parse.quote(actor_name)
+        dossier_links.append(f"[Search MITRE](https://attack.mitre.org/?q={q})")
+
+    malpedia_family = profile.get("malpedia") if profile else None
+    if malpedia_family:
+        dossier_links.append(f"[Malpedia](https://malpedia.caad.fkie.fraunhofer.de/details/{malpedia_family})")
+
+    if extra_dossier_link:
+        dossier_links.append(extra_dossier_link)
+    else:
+        group_slug = urllib.parse.quote(slug)
+        if (publisher or "").strip().lower() == "ransomlook":
+            dossier_links.append(f"[Ransomware.live](https://www.ransomware.live/group/{group_slug})")
+        else:
+            dossier_links.append(f"[RansomLook](https://www.ransomlook.io/group/{group_slug})")
+
+    dossier = " • ".join(dossier_links)
+
+    yaml_block = (
+        "```yaml\n"
+        f"Name           : {actor_name}\n"
+        f"Origin Country : {origin}\n"
+        f"{stat}\n"
+        "```\n"
+        f"🎯 Dossier: {dossier}"
+    )
 
     return {
-        "name": "⚔️ Adversary Tradecraft & Known TTPs",
-        "value": val,
+        "name": "Threat Actor Info",
+        "value": yaml_block,
         "inline": False,
     }
+
+format_actor_ttp_field = format_threat_actor_info
+
