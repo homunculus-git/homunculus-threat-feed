@@ -1,7 +1,11 @@
 import hashlib
+import html
 import http.server
+import ipaddress
 import os
+import re
 import shutil
+import socket
 import socketserver
 import subprocess
 import threading
@@ -25,6 +29,75 @@ ACTIVE_DOWNLOADS = set()
 ACTIVE_DOWNLOADS_LOCK = threading.Lock()
 
 os.makedirs(SANDBOX_DIR, exist_ok=True)
+
+
+def _load_abusech_key() -> str:
+    """Resolve ABUSECH_AUTH_KEY from environment or local .env files."""
+    key = (os.getenv("ABUSECH_AUTH_KEY") or "").strip()
+    if key:
+        return key
+    candidates = [
+        os.path.expanduser("~/homunculus/homunculus-threat-feed/.env"),
+        os.path.expanduser("~/homunculus/bounty/.env"),
+    ]
+    for env_path in candidates:
+        if not os.path.isfile(env_path):
+            continue
+        try:
+            with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    if k.strip() == "ABUSECH_AUTH_KEY":
+                        val = v.strip().strip('"').strip("'")
+                        if val:
+                            return val
+        except Exception:
+            pass
+    return ""
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address(ip_str.split("%")[0])
+        return not (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_reserved
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_unspecified
+        )
+    except ValueError:
+        return False
+
+
+def _is_safe_remote_url(url: str) -> bool:
+    """Allow only http/https URLs whose hostname resolves exclusively to public routable IPs."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return False
+        host = (parsed.hostname or "").strip().strip("[]")
+        if not host:
+            return False
+        addr_info = socket.getaddrinfo(host, None)
+        resolved_ips = [r[4][0] for r in addr_info if r and len(r) > 4 and r[4]]
+        return bool(resolved_ips) and all(_is_public_ip(ip) for ip in resolved_ips)
+    except Exception:
+        return False
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_safe_remote_url(newurl):
+            raise urllib.error.URLError(f"Blocked unsafe redirect target: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SAFE_OPENER = urllib.request.build_opener(_SafeRedirectHandler())
 
 
 def notify(env, title, message):
@@ -85,7 +158,7 @@ def create_download_key(target_url, sha256):
     return hashlib.sha256(material).hexdigest()
 
 
-class GhidraBridgeHandler(http.server.SimpleHTTPRequestHandler):
+class GhidraBridgeHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
@@ -95,11 +168,30 @@ class GhidraBridgeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             return
 
-        target_url = params.get("target", [""])[0]
-        sha256 = params.get("hash", [""])[0]
+        # Block cross-origin subresource/iframe/fetch drive-by triggers (<img>, <script>, <iframe>, fetch)
+        sec_mode = (self.headers.get("Sec-Fetch-Mode") or "").strip().lower()
+        sec_dest = (self.headers.get("Sec-Fetch-Dest") or "").strip().lower()
+        origin = (self.headers.get("Origin") or "").strip().lower()
+
+        if (
+            (sec_mode and sec_mode not in ("navigate", "same-origin"))
+            or (sec_dest and sec_dest not in ("document", "empty"))
+            or (origin and origin not in (f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"))
+        ):
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Forbidden: cross-origin subresource request blocked.")
+            return
+
+        target_url = params.get("target", [""])[0].strip()
+        sha256 = params.get("hash", [""])[0].strip()
+        safe_display = html.escape(target_url or sha256 or "Local Ghidra Project", quote=True)
 
         self.send_response(200)
-        self.send_header("Content-type", "text/html")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
         self.end_headers()
 
         response_html = f"""
@@ -107,7 +199,7 @@ class GhidraBridgeHandler(http.server.SimpleHTTPRequestHandler):
         <html><head><title>Ghidra Lab Dispatcher</title></head>
         <body style="font-family:monospace;background:#11111b;color:#cdd6f4;padding:30px;text-align:center;">
         <h2 style="color:#89b4fa;">⚡ Acquisition dispatched</h2>
-        <p>Target: <code>{target_url or sha256}</code></p>
+        <p>Target: <code>{safe_display}</code></p>
         <p style="color:#a6e3a1;">A complete sample will open in Ghidra only after acquisition succeeds.</p>
         <script>setTimeout(() => window.close(), 2000);</script>
         </body></html>
@@ -131,11 +223,43 @@ class GhidraBridgeHandler(http.server.SimpleHTTPRequestHandler):
             notify(env, "⚠ Ghidra Lab", "Ghidra is not installed or not executable")
             return
 
+        # MalwareBazaar hash-only acquisition (?hash=<sha256>)
+        if not target_url and sha256:
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+                print(f"[!] Invalid SHA256 hash parameter: {sha256}", flush=True)
+                notify(env, "⚠ Ghidra Lab", "Invalid SHA256 hash format")
+                return
+            download_key = create_download_key("malwarebazaar", sha256.lower())
+            with ACTIVE_DOWNLOADS_LOCK:
+                if download_key in ACTIVE_DOWNLOADS:
+                    print(f"[*] MalwareBazaar download already in progress: {sha256}", flush=True)
+                    notify(env, "ℹ Ghidra Lab", "Sample download already in progress")
+                    return
+                ACTIVE_DOWNLOADS.add(download_key)
+            try:
+                ok, saved_path, total_bytes = self.download_malwarebazaar_sample(sha256.lower(), env)
+                if ok:
+                    notify(
+                        env,
+                        "⚡ Ghidra Lab",
+                        f"MalwareBazaar archive saved: {os.path.basename(saved_path)} ({total_bytes} bytes)",
+                    )
+                    self.open_ghidra(env)
+            finally:
+                with ACTIVE_DOWNLOADS_LOCK:
+                    ACTIVE_DOWNLOADS.discard(download_key)
+            return
+
         if not target_url:
             self.open_ghidra(env)
             return
 
         real_url = refang_url(target_url)
+        if not _is_safe_remote_url(real_url):
+            print(f"[!] Blocked unsafe or non-public URL target: {real_url}", flush=True)
+            notify(env, "⚠ Ghidra Lab", "Blocked unsafe or internal target URL")
+            return
+
         download_key = create_download_key(real_url, sha256)
 
         with ACTIVE_DOWNLOADS_LOCK:
@@ -179,6 +303,31 @@ class GhidraBridgeHandler(http.server.SimpleHTTPRequestHandler):
             with ACTIVE_DOWNLOADS_LOCK:
                 ACTIVE_DOWNLOADS.discard(download_key)
 
+    def download_malwarebazaar_sample(self, sha256: str, env: dict) -> tuple[bool, str, int]:
+        auth_key = _load_abusech_key()
+        headers = {"User-Agent": "Homunculus-Ghidra-Bridge/1.0"}
+        if auth_key:
+            headers["Auth-Key"] = auth_key
+
+        post_data = urllib.parse.urlencode({"query": "get_file", "sha256_hash": sha256}).encode("utf-8")
+        req = urllib.request.Request("https://mb-api.abuse.ch/api/v1/", data=post_data, headers=headers, method="POST")
+        sample_path = os.path.join(SANDBOX_DIR, f"bazaar_{sha256[:12]}.zip")
+        try:
+            with _SAFE_OPENER.open(req, timeout=DOWNLOAD_SOCKET_TIMEOUT) as resp:
+                body = resp.read(50 * 1024 * 1024)
+            if not body or b'"query_status": "file_not_found"' in body[:512] or b'"query_status": "http_post_expected"' in body[:512]:
+                print(f"[!] MalwareBazaar sample not found or unavailable for {sha256}", flush=True)
+                notify(env, "⚠ Ghidra Lab", f"MalwareBazaar sample unavailable ({sha256[:12]})")
+                return False, sample_path, 0
+            with open(sample_path, "wb") as f:
+                f.write(body)
+            print(f"[+] Downloaded MalwareBazaar sample ({len(body)} bytes) to {sample_path}", flush=True)
+            return True, sample_path, len(body)
+        except Exception as err:
+            print(f"[!] MalwareBazaar sample download failed for {sha256}: {err}", flush=True)
+            notify(env, "⚠ Ghidra Lab", f"MalwareBazaar download failed ({sha256[:12]})")
+            return False, sample_path, 0
+
     def download_payload(self, real_url, sample_path, part_path, env):
         started_at = time.monotonic()
         last_error = None
@@ -214,7 +363,7 @@ class GhidraBridgeHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 request = urllib.request.Request(real_url, headers=headers)
 
-                with urllib.request.urlopen(
+                with _SAFE_OPENER.open(
                     request,
                     timeout=DOWNLOAD_SOCKET_TIMEOUT,
                 ) as response:
