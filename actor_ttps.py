@@ -226,7 +226,7 @@ def format_threat_actor_info(
     profile = RANSOM_ACTOR_PROFILES.get(slug)
     actor_name = profile["actor"] if profile else cleaned
     origin = profile.get("origin_country", "Unknown / Unconfirmed Origin") if profile else "Unknown / Unconfirmed Origin"
-    stat = stat_line or "Activity Stat  : Active monitored syndicate in threat feed cache"
+    stat = stat_line or "Past 30 Days   : Active monitored syndicate (last 30 days)"
 
     dossier_links = []
     if profile and profile.get("mitre_id"):
